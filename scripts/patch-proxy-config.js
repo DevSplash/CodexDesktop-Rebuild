@@ -181,16 +181,24 @@ function patchSource(source) {
   if (source.includes(MARKER)) {
     const start = source.indexOf("/* " + MARKER + " */");
     const end = source.indexOf("})();", start);
-    if (start !== -1 && end !== -1) {
-      const blockEnd = end + "})();".length;
-      const current = source.slice(start, blockEnd);
-      if (current === INJECTED) return { code: source, status: "already" };
-      return {
-        code: `${source.slice(0, start)}${INJECTED}${source.slice(blockEnd)}`,
-        status: "updated",
-      };
+
+    // If we see the marker but can't find a well-formed injected block,
+    // treat this as a mismatch so callers can log/handle the anomaly.
+    if (start === -1 || end === -1) {
+      return { code: source, status: "no-match" };
     }
-    return { code: source, status: "already" };
+
+    const blockEnd = end + "})();".length;
+    const current = source.slice(start, blockEnd);
+
+    if (current === INJECTED) {
+      return { code: source, status: "already" };
+    }
+
+    return {
+      code: `${source.slice(0, start)}${INJECTED}${source.slice(blockEnd)}`,
+      status: "updated",
+    };
   }
 
   const electronRequire = /require\((["'`])electron\1\)/.exec(source);
