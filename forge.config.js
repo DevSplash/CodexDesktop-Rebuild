@@ -8,25 +8,37 @@ module.exports = {
     executableName: "Codex",
     appBundleId: "com.openai.codex",
     icon: "./resources/electron",
-    asar: {
-      unpack: "{**/*.node,**/node-pty/build/Release/spawn-helper,**/node-pty/prebuilds/*/spawn-helper}",
-    },
-    extraResource: ["./resources/notification.wav"],
-    ignore: (filePath) => {
-      if (filePath === "") return false;
-      const allowedPrefixes = [
-        "/src/.vite/build",
-        "/src/webview",
-        "/src/skills",
-        "/src/native-menu-locales",
-        "/node_modules",
-      ];
-      if (filePath === "/package.json") return false;
-      for (const prefix of allowedPrefixes) {
-        if (prefix.startsWith(filePath) || filePath.startsWith(prefix)) return false;
-      }
-      return true;
-    },
+    // Build mode is set by prepare-src.js via src/.build-mode marker file.
+    // "upstream-asar": mac/win — we provide pre-built app.asar, forge skips ASAR packing.
+    // "linux": forge packs ASAR from src/ content (needs electron-rebuild).
+    asar: (() => {
+      try {
+        return fs.readFileSync(path.join(__dirname, "src", ".build-mode"), "utf-8").trim() === "upstream-asar"
+          ? false
+          : { unpack: "{**/*.node,**/node-pty/build/Release/spawn-helper,**/node-pty/prebuilds/*/spawn-helper}" };
+      } catch { return false; }
+    })(),
+    ignore: (() => {
+      let mode = "upstream-asar";
+      try { mode = fs.readFileSync(path.join(__dirname, "src", ".build-mode"), "utf-8").trim(); } catch {}
+      return mode === "upstream-asar"
+        ? (filePath) => {
+            // Allow only package.json + stub main entry (forge validates it)
+            if (filePath === "") return false;
+            if (filePath === "/package.json") return false;
+            if (filePath === "/src" || filePath.startsWith("/src/.vite")) return false;
+            return true;
+          }
+        : (filePath) => {
+            if (filePath === "") return false;
+            if (filePath === "/package.json") return false;
+            const allowed = ["/src/.vite/build", "/src/webview", "/src/skills", "/src/native-menu-locales", "/src/node_modules"];
+            for (const p of allowed) {
+              if (p.startsWith(filePath) || filePath.startsWith(p)) return false;
+            }
+            return true;
+          };
+    })(),
     osxSign: process.env.SKIP_SIGN ? undefined : {
       identity: process.env.APPLE_IDENTITY,
       identityValidation: false,
@@ -67,7 +79,7 @@ module.exports = {
     { name: "@electron-forge/maker-zip", platforms: ["linux"] },
   ],
   plugins: [
-    { name: "@electron-forge/plugin-auto-unpack-natives", config: {} },
+    // No auto-unpack-natives — we provide upstream app.asar.unpacked directly
     {
       name: "@electron-forge/plugin-fuses",
       config: {
@@ -82,27 +94,42 @@ module.exports = {
     },
   ],
   hooks: {
-    // Copy all upstream resources (repacked app.asar, unpacked, binaries, plugins, etc.)
-    // prepare-src.js already repacked the ASAR and replaced codex binary.
-    // This hook copies everything from the platform dir to the app's Resources.
+    // Copy everything from the platform dir to the app's Resources:
+    // - app.asar (repacked by prepare-src with patches applied)
+    // - app.asar.unpacked/ (upstream native modules, untouched)
+    // - All other resources (codex CLI, rg, plugins, native, etc.)
+    //
+    // Forge's own ASAR packing is disabled (asar: false).
+    // buildPath points to the app dir — we put app.asar alongside it.
     packageAfterCopy: async (config, buildPath, electronVersion, platform, arch) => {
       console.log(`\n-- packageAfterCopy: ${platform}-${arch}`);
 
       const resourcesPath = path.dirname(buildPath);
       const platformKey = platform === "win32" ? "win"
-        : platform === "linux" ? `mac-${arch}` // Linux uses macOS ASAR
+        : platform === "linux" ? `mac-${arch}`
         : `mac-${arch}`;
 
       const platformDir = path.join(__dirname, "src", platformKey);
       if (!fs.existsSync(platformDir)) {
-        console.log(`   [!] Platform dir not found: src/${platformKey}/`);
+        console.log(`   [!] src/${platformKey}/ not found`);
         return;
       }
 
-      // Skip items that forge handles (ASAR content is already in buildPath)
-      const skip = new Set(["_asar", "app.asar"]);
+      // Keep buildPath (app/) with package.json — forge needs it after this hook.
+      // Our app.asar goes alongside it in Resources/.
 
+      const skip = new Set(["_asar"]); // _asar is working dir, already repacked into app.asar
       let copied = 0;
+
+      const copyDir = (s, d) => {
+        fs.mkdirSync(d, { recursive: true });
+        for (const e of fs.readdirSync(s, { withFileTypes: true })) {
+          const sp = path.join(s, e.name), dp = path.join(d, e.name);
+          if (e.isDirectory()) copyDir(sp, dp);
+          else if (!e.isSymbolicLink()) { fs.copyFileSync(sp, dp); copied++; }
+        }
+      };
+
       for (const entry of fs.readdirSync(platformDir, { withFileTypes: true })) {
         if (skip.has(entry.name)) continue;
         if (entry.name.endsWith(".lproj")) continue;
@@ -111,14 +138,6 @@ module.exports = {
         const destPath = path.join(resourcesPath, entry.name);
 
         if (entry.isDirectory()) {
-          const copyDir = (s, d) => {
-            fs.mkdirSync(d, { recursive: true });
-            for (const e of fs.readdirSync(s, { withFileTypes: true })) {
-              const sp = path.join(s, e.name), dp = path.join(d, e.name);
-              if (e.isDirectory()) copyDir(sp, dp);
-              else if (!e.isSymbolicLink()) { fs.copyFileSync(sp, dp); copied++; }
-            }
-          };
           copyDir(srcPath, destPath);
         } else if (!entry.isSymbolicLink()) {
           fs.copyFileSync(srcPath, destPath);
@@ -127,7 +146,7 @@ module.exports = {
         }
       }
 
-      console.log(`   [ok] ${copied} extra resources copied`);
+      console.log(`   [ok] ${copied} files (app.asar + unpacked + resources)`);
     },
   },
 };

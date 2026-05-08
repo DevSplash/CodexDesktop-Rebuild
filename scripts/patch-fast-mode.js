@@ -2,37 +2,26 @@
 /**
  * Post-build patch: Force-enable Fast mode (speed selector)
  *
- * The speed selector (Fast / Standard) is gated behind two conditions:
- *   1. Statsig feature flag: statsig_default_enable_features.fast_mode === true
- *   2. Auth method check: authMethod === "chatgpt"
+ * The speed selector is gated by authMethod === "chatgpt" checks.
+ * API-key users never see it because their authMethod differs.
  *
- * The visibility hook returns:
- *   n?.fast_mode === !0 && Dt(t)
- * where Dt(e) { return e === `chatgpt` }
+ * This patch locates BinaryExpression nodes matching:
+ *   X.authMethod !== "chatgpt"
+ * inside functions that also reference "fast_mode", and replaces
+ * the comparison with !1 (always false), removing the auth gate.
  *
- * This patch locates the hook via AST (function containing
- * "statsig_default_enable_features") and replaces the gating
- * LogicalExpression with !0, making the speed selector always visible.
- *
- * Target file: general-settings-*.js chunk
- *
- * Usage:
- *   node scripts/patch-fast-mode.js [platform]   # Apply (unix/win/omit=both)
- *   node scripts/patch-fast-mode.js --check       # Dry-run
+ * Target: permissions-mode-helpers-*.js (or any chunk with the pattern)
  */
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("acorn");
-const { locateBundles, relPath } = require("./patch-util");
-
-// ──────────────────────────────────────────────
-//  AST walker
-// ──────────────────────────────────────────────
+const { locateBundles, relPath, SRC_DIR } = require("./patch-util");
 
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
   if (node.type) visitor(node);
   for (const key of Object.keys(node)) {
+    if (key === "type" || key === "start" || key === "end") continue;
     const child = node[key];
     if (Array.isArray(child)) {
       for (const item of child) {
@@ -44,144 +33,57 @@ function walk(node, visitor) {
   }
 }
 
-// ──────────────────────────────────────────────
-//  Patch logic
-// ──────────────────────────────────────────────
-
-const FEATURE_STORE_KEY = "statsig_default_enable_features";
-const FAST_MODE_KEY = "fast_mode";
-
 function collectPatches(ast, source) {
   const patches = [];
 
   walk(ast, (node) => {
-    // Match function containing "statsig_default_enable_features"
-    if (
-      node.type !== "FunctionDeclaration" &&
-      node.type !== "FunctionExpression" &&
-      node.type !== "ArrowFunctionExpression"
-    )
-      return;
+    // Match function bodies containing both authMethod and fast_mode
+    const isFn =
+      node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression";
+    if (!isFn) return;
 
-    const funcSrc = source.slice(node.start, node.end);
-    if (!funcSrc.includes(FEATURE_STORE_KEY)) return;
-    if (!funcSrc.includes(FAST_MODE_KEY)) return;
+    const fnSrc = source.slice(node.start, node.end);
+    if (!fnSrc.includes("authMethod") || !fnSrc.includes("fast_mode")) return;
 
-    // Inside this function, find the LogicalExpression:
-    //   X?.fast_mode === !0 && Dt(Y)
-    // Pattern: LogicalExpression { operator: "&&",
-    //   left: BinaryExpression { operator: "===", right: UnaryExpression(!0) }
-    //   right: CallExpression { callee: Identifier, arguments: [Identifier] }
-    // }
+    // Inside this function, find: X.authMethod !== `chatgpt`
     walk(node, (child) => {
-      if (child.type !== "LogicalExpression" || child.operator !== "&&") return;
+      if (child.type !== "BinaryExpression" || child.operator !== "!==") return;
 
-      const left = child.left;
-      const right = child.right;
-
-      // left must be: X === !0
-      if (
-        !left ||
-        left.type !== "BinaryExpression" ||
-        left.operator !== "==="
-      )
+      const childSrc = source.slice(child.start, child.end);
+      if (!childSrc.includes("authMethod") || !childSrc.includes("chatgpt"))
         return;
 
-      // left.right must be !0 (UnaryExpression: !0)
-      const lr = left.right;
-      if (
-        !lr ||
-        lr.type !== "UnaryExpression" ||
-        lr.operator !== "!" ||
-        lr.argument?.value !== 0
-      )
-        return;
+      if (childSrc === "!1") return;
 
-      // left.left should reference fast_mode (MemberExpression with .fast_mode)
-      const ll = left.left;
-      if (!ll) return;
-      const llSrc = source.slice(ll.start, ll.end);
-      if (!llSrc.includes(FAST_MODE_KEY)) return;
-
-      // right must be a call: Dt(identifier)
-      if (!right || right.type !== "CallExpression") return;
-      if (right.arguments.length !== 1) return;
-
-      const exprSrc = source.slice(child.start, child.end);
-      if (exprSrc === "!0") return; // already patched
+      // Avoid duplicate patches at same offset
+      if (patches.some((p) => p.start === child.start)) return;
 
       patches.push({
-        id: "fast_mode_gate",
+        id: "fast_mode_auth_gate",
         start: child.start,
         end: child.end,
-        replacement: "!0",
-        original: exprSrc,
+        replacement: "!1",
+        original: childSrc,
       });
-
-      // Also find the auth check function (Dt) and patch it
-      // Dt is the callee of the right side
-      const authFuncName = right.callee?.name;
-      if (authFuncName) {
-        findAndPatchAuthFunc(ast, source, authFuncName, patches);
-      }
     });
   });
 
   return patches;
 }
 
-/**
- * Find function authFuncName(e) { return e === `chatgpt` }
- * and replace the return expression with !0
- */
-function findAndPatchAuthFunc(ast, source, funcName, patches) {
-  walk(ast, (node) => {
-    // Match: function funcName(e) { return e === `chatgpt` }
-    if (node.type !== "FunctionDeclaration") return;
-    if (!node.id || node.id.name !== funcName) return;
-
-    const body = node.body;
-    if (!body || body.type !== "BlockStatement") return;
-    if (body.body.length !== 1) return;
-
-    const ret = body.body[0];
-    if (ret.type !== "ReturnStatement" || !ret.argument) return;
-
-    const arg = ret.argument;
-    if (arg.type !== "BinaryExpression" || arg.operator !== "===") return;
-
-    const retSrc = source.slice(arg.start, arg.end);
-    if (retSrc === "!0") return; // already patched
-    if (!retSrc.includes("chatgpt")) return;
-
-    // Don't add duplicate
-    if (patches.some((p) => p.start === arg.start)) return;
-
-    patches.push({
-      id: "auth_method_check",
-      start: arg.start,
-      end: arg.end,
-      replacement: "!0",
-      original: retSrc,
-    });
-  });
-}
-
-// ──────────────────────────────────────────────
-//  Main
-// ──────────────────────────────────────────────
-
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
-  const platform = args.find((a) => ["mac-arm64", "mac-x64", "win"].includes(a));
+  const platform = args.find((a) =>
+    ["mac-arm64", "mac-x64", "win"].includes(a),
+  );
 
-  // Scan JS chunks for fast_mode gate logic (chunk name varies across versions)
-  const { SRC_DIR } = require("./patch-util");
   const platforms = platform
     ? [platform]
     : ["mac-arm64", "mac-x64", "win"].filter((p) =>
-        fs.existsSync(path.join(SRC_DIR, p, "_asar", "webview", "assets"))
+        fs.existsSync(path.join(SRC_DIR, p, "_asar", "webview", "assets")),
       );
 
   const targets = [];
@@ -190,51 +92,43 @@ function main() {
     if (!fs.existsSync(assetsDir)) continue;
     for (const f of fs.readdirSync(assetsDir)) {
       if (!f.endsWith(".js")) continue;
-      // No longer skip index — fast_mode gate may live in any chunk
       const fp = path.join(assetsDir, f);
       const src = fs.readFileSync(fp, "utf-8");
-      if (src.includes(FEATURE_STORE_KEY) && src.includes(FAST_MODE_KEY)) {
+      if (src.includes("authMethod") && src.includes("fast_mode")) {
         targets.push({ platform: plat, path: fp });
       }
     }
   }
 
   if (targets.length === 0) {
-    console.error("[x] No chunk contains fast_mode gate logic");
-    process.exit(1);
+    console.log("  [skip] No chunk contains fast_mode gate logic");
+    return;
   }
 
+  let totalPatched = 0;
+
   for (const bundle of targets) {
-    console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
     const source = fs.readFileSync(bundle.path, "utf-8");
-    console.log(`   size: ${(source.length / 1024 / 1024).toFixed(1)} MB`);
 
     const t0 = Date.now();
-    const ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
-    console.log(`   parse: ${Date.now() - t0}ms`);
-
-    const patches = collectPatches(ast, source);
-
-    if (patches.length === 0) {
-      if (source.includes(FEATURE_STORE_KEY)) {
-        // Check if already patched
-        const idx = source.indexOf(FEATURE_STORE_KEY);
-        const nearby = source.slice(idx, idx + 300);
-        if (!nearby.includes("===!0&&")) {
-          console.log("   [ok] Fast mode already force-enabled");
-        } else {
-          console.log("   [!] fast_mode gate found but AST pattern did not match");
-        }
-      } else {
-        console.log("   [!] statsig_default_enable_features not found");
-      }
+    let ast;
+    try {
+      ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+    } catch {
       continue;
     }
 
+    const patches = collectPatches(ast, source);
+
+    if (patches.length === 0) continue;
+
+    console.log(
+      `  [${bundle.platform}] ${relPath(bundle.path)} (parse ${Date.now() - t0}ms)`,
+    );
+
     if (isCheck) {
-      console.log(`   [?] Matches: ${patches.length}`);
       for (const p of patches) {
-        console.log(`     > [${p.id}] offset ${p.start}: ${p.original} -> ${p.replacement}`);
+        console.log(`    [?] offset ${p.start}: ${p.original} -> ${p.replacement}`);
       }
       continue;
     }
@@ -243,12 +137,18 @@ function main() {
 
     let code = source;
     for (const p of patches) {
-      console.log(`   * [${p.id}] offset ${p.start}: ${p.original} -> ${p.replacement}`);
+      console.log(`    * ${p.original} -> ${p.replacement}`);
       code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
     }
 
     fs.writeFileSync(bundle.path, code, "utf-8");
-    console.log(`   [ok] Fast mode force-enabled: ${patches.length} replacements`);
+    totalPatched += patches.length;
+  }
+
+  if (totalPatched > 0) {
+    console.log(`  [ok] ${totalPatched} auth gate(s) removed`);
+  } else {
+    console.log("  [ok] fast_mode auth gates already patched or absent");
   }
 }
 

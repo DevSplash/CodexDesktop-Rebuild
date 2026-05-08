@@ -10,6 +10,7 @@ dist/
 
 # Upstream ASAR extracts and build-time copies (all generated)
 src/
+src/.build-mode
 
 # Version check state (local only)
 scripts/.versions.json

@@ -60,25 +60,47 @@ function resolveCodexVendor(platform) {
   const isWin = platform === "win";
   const binName = isWin ? "codex.exe" : "codex";
 
-  // 1. Try local node_modules
+  // 1. Try platform-specific package (0.128+)
+  const PLAT_PKG = {
+    "linux-x64": "codex-linux-x64", "linux-arm64": "codex-linux-arm64",
+    "mac-arm64": "codex-darwin-arm64", "mac-x64": "codex-darwin-x64", "win": "codex-win32-x64",
+  };
+  const pkg = PLAT_PKG[platform];
+  if (pkg) {
+    const p = path.join(PROJECT_ROOT, "node_modules", "@cometix", pkg, "vendor", triple, "codex", binName);
+    if (fs.existsSync(p)) return p;
+  }
+  // 2. Try old-style vendor (pre-0.128)
   const localPath = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple, "codex", binName);
   if (fs.existsSync(localPath)) return localPath;
 
-  // 2. npm pack + extract
-  console.log("   [codex] fetching @cometix/codex via npm pack...");
+  // 3. npm pack platform package
+  const PLAT_SUFFIX = {
+    "linux-x64": "linux-x64", "linux-arm64": "linux-arm64",
+    "mac-arm64": "darwin-arm64", "mac-x64": "darwin-x64", "win": "win32-x64",
+  };
+  const suffix = PLAT_SUFFIX[platform];
+  if (!suffix) return null;
+
+  let baseVer;
+  try {
+    baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+  } catch { return null; }
+
+  const spec = `@cometix/codex@${baseVer}-${suffix}`;
+  console.log(`   [codex] fetching ${spec} via npm pack...`);
   const tmpDir = path.join(require("os").tmpdir(), "cometix-codex-pack");
-  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+  fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-    const tgzName = execSync("npm pack @cometix/codex@latest --pack-destination " + tmpDir, {
+    const tgzName = execSync(`npm pack ${spec} --pack-destination "${tmpDir}"`, {
       cwd: tmpDir, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
     }).trim().split("\n").pop();
 
-    const tgzPath = path.join(tmpDir, tgzName);
     const extractDir = path.join(tmpDir, "extracted");
     if (fs.existsSync(extractDir)) fs.rmSync(extractDir, { recursive: true });
     fs.mkdirSync(extractDir, { recursive: true });
-    execSync(`tar xzf "${tgzPath}" -C "${extractDir}"`, { stdio: "pipe" });
+    execSync(`tar xzf "${path.join(tmpDir, tgzName)}" -C "${extractDir}"`, { stdio: "pipe" });
 
     const vendorPath = path.join(extractDir, "package", "vendor", triple, "codex", binName);
     if (fs.existsSync(vendorPath)) return vendorPath;
@@ -139,21 +161,20 @@ function main() {
     console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
   }
 
-  // 3. Copy to flat src/ for forge
-  // Clear forge-visible dirs
-  for (const d of [".vite", "webview", "skills", "node_modules", "native-menu-locales"]) {
-    const p = path.join(SRC, d);
-    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true });
+  // 3. For Linux: copy _asar/ content to flat src/ (forge packs ASAR from src/)
+  if (isLinux) {
+    // Clear flat src/ dirs
+    for (const d of [".vite", "webview", "skills", "native-menu-locales", "node_modules"]) {
+      const p = path.join(SRC, d);
+      if (fs.existsSync(p)) fs.rmSync(p, { recursive: true });
+    }
+    for (const f of fs.readdirSync(SRC)) {
+      const p = path.join(SRC, f);
+      if (fs.statSync(p).isFile()) fs.unlinkSync(p);
+    }
+    const count = copyRecursive(asarContentDir, SRC);
+    console.log(`   [linux] _asar/ -> src/ (${count} files for forge ASAR packing)`);
   }
-  // Remove loose files in src/ (but keep platform dirs)
-  for (const f of fs.readdirSync(SRC)) {
-    const p = path.join(SRC, f);
-    if (fs.statSync(p).isFile()) fs.unlinkSync(p);
-  }
-
-  // Copy ASAR content to src/ (forge needs this for package.json main entry)
-  const asarCount = copyRecursive(asarContentDir, SRC);
-  console.log(`   [copy] _asar/ -> src/ (${asarCount} files for forge)`)
 
   // 4. Sync version to root package.json
   const upstreamPkg = path.join(asarContentDir, "package.json");
@@ -175,6 +196,24 @@ function main() {
     fs.writeFileSync(rootPkgPath, JSON.stringify(rootPkg, null, 2) + "\n");
     console.log(`   version: ${oldVer} -> ${rootPkg.version}`);
   }
+
+  // For mac/win: create stub main entry so forge validation passes.
+  // The real code is in app.asar which we copy in packageAfterCopy.
+  if (!isLinux) {
+    const stubDir = path.join(SRC, ".vite", "build");
+    fs.mkdirSync(stubDir, { recursive: true });
+    fs.writeFileSync(path.join(stubDir, "bootstrap.js"), "// stub - real code in app.asar\n");
+    // Also need package.json in src/ for forge
+    const asarPkg = path.join(asarContentDir, "package.json");
+    if (fs.existsSync(asarPkg)) {
+      fs.copyFileSync(asarPkg, path.join(SRC, "package.json"));
+    }
+  }
+
+  // Write build mode marker for forge.config.js
+  const marker = path.join(SRC, ".build-mode");
+  fs.writeFileSync(marker, isLinux ? "linux" : "upstream-asar");
+  console.log(`   [mode] ${isLinux ? "linux (forge packs ASAR)" : "upstream-asar (pre-built)"}`);
 
   console.log(`   [ok] src/ ready for ${platform} build`);
 }
