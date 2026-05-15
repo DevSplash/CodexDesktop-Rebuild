@@ -86,17 +86,12 @@ jobs:
 
       - name: Build
         run: npm run build:mac-${{ matrix.arch }}
-        env:
-          SKIP_SIGN: "true"
-          SKIP_NOTARIZE: "true"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: Codex-macOS-${{ matrix.arch }}
-          path: |
-            out/make/*.dmg
-            out/make/zip/**/*.zip
+          path: out/*.dmg
           if-no-files-found: error
 
   build-windows:
@@ -139,9 +134,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: Codex-Windows-x64
-          path: |
-            out/make/squirrel.windows/**/*
-            out/make/zip/**/*.zip
+          path: out/*.zip
           if-no-files-found: error
 
   build-linux:

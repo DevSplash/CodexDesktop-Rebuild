@@ -92,10 +92,12 @@ function findPluginAuthPatches(ast, source) {
 }
 
 // ──────────────────────────────────────────────
-//  Rule 2: Browser-use gate — m(`410262010`) → !0
+//  Rule 2: Statsig gate bypasses — gt(`ID`) → !0
+//    410262010 — browser-use availability
+//    410065390 — external browser (Chrome extension)
 // ──────────────────────────────────────────────
 
-const BROWSER_USE_GATE_ID = "410262010";
+const STATSIG_GATE_IDS = new Set(["410262010", "410065390"]);
 
 function findBrowserUsePatches(ast, source) {
   const patches = [];
@@ -105,7 +107,7 @@ function findBrowserUsePatches(ast, source) {
     if (node.arguments.length !== 1) return;
 
     const argVal = getLiteralValue(node.arguments[0]);
-    if (argVal !== BROWSER_USE_GATE_ID) return;
+    if (!STATSIG_GATE_IDS.has(argVal)) return;
 
     // Callee must be a simple identifier (gate checker function)
     if (node.callee.type !== "Identifier") return;
@@ -114,7 +116,7 @@ function findBrowserUsePatches(ast, source) {
     if (exprSrc === "!0") return;
 
     patches.push({
-      id: "browser_use_gate",
+      id: `statsig_gate_${argVal}`,
       start: node.start,
       end: node.end,
       replacement: "!0",
@@ -152,9 +154,12 @@ function locateTargets(platform) {
         targets.push({ platform: plat, path: fp, type: "plugin_auth" });
       }
 
-      // Browser-use gate: file contains the gate ID
-      if (src.includes(BROWSER_USE_GATE_ID) && src.includes("browser_use")) {
-        targets.push({ platform: plat, path: fp, type: "browser_use" });
+      // Statsig gates: file contains any tracked gate ID
+      for (const gateId of STATSIG_GATE_IDS) {
+        if (src.includes(gateId)) {
+          targets.push({ platform: plat, path: fp, type: "statsig_gate" });
+          break;
+        }
       }
     }
   }

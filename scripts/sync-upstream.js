@@ -66,16 +66,22 @@ function curlDownload(url, dest, label) {
   execSync(`curl -L --retry 3 --retry-delay 2 -o "${dest}" "${url}"`, { stdio: "inherit" });
 }
 
-function extract7z(archive, dest) {
-  for (const bin of ["7zz", "7z"]) {
-    try {
-      execSync(`${bin} x -y -o"${dest}" "${archive}"`, { stdio: "pipe" });
-      return;
-    } catch {
-      if (fs.readdirSync(dest).length > 0) return;
+function extractArchive(archive, dest) {
+  if (process.platform === "darwin" && archive.endsWith(".zip")) {
+    // ditto preserves macOS symlinks + resource forks (required for .app)
+    execSync(`ditto -xk "${archive}" "${dest}"`);
+  } else {
+    // 7zz for Windows MSIX and Linux (symlinks don't matter — only ASAR content used)
+    for (const bin of ["7zz", "7z"]) {
+      try {
+        execSync(`${bin} x -y -o"${dest}" "${archive}"`, { stdio: "pipe" });
+        return;
+      } catch {
+        if (fs.readdirSync(dest).length > 0) return;
+      }
     }
+    throw new Error(`Failed to extract ${archive}`);
   }
-  throw new Error(`Failed to extract ${archive}`);
 }
 
 function findFile(dir, name) {
@@ -165,7 +171,7 @@ async function syncMac(variant, appcastUrl, destDir) {
 
   console.log("   [unzip]");
   clearDir(extractDir);
-  extract7z(zipPath, extractDir);
+  extractArchive(zipPath, extractDir);
 
   const resourcesDir = findResourcesDir(extractDir);
   if (!resourcesDir) throw new Error(`${label}: Resources directory not found`);
@@ -193,10 +199,7 @@ async function syncWin(destDir) {
 
   console.log("   [unzip]");
   clearDir(extractDir);
-  for (const bin of ["7zz", "7z"]) {
-    try { execSync(`${bin} x -y -o"${extractDir}" "${msixPath}"`, { stdio: "pipe" }); break; }
-    catch { if (fs.readdirSync(extractDir).length > 0) break; }
-  }
+  extractArchive(msixPath, extractDir);
 
   const resourcesDir = path.join(extractDir, "app", "resources");
   if (!fs.existsSync(resourcesDir)) {

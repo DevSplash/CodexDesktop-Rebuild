@@ -51,42 +51,83 @@ function copyRecursive(src, dest, skipFiles, skipDirs) {
 }
 
 /**
- * Resolve codex CLI binary from @cometix/codex.
- * Tries node_modules first, falls back to npm pack + extract.
+ * Ensure the @cometix/codex platform package is extracted to a temp dir.
+ * Returns the vendor root path (e.g. .../vendor/{triple}/) or null.
+ * Caches the result so npm pack runs at most once per build.
  */
-function resolveCodexVendor(platform) {
+let _vendorRootCache = null;
+function ensureVendorExtracted(platform) {
+  if (_vendorRootCache !== undefined && _vendorRootCache !== null) return _vendorRootCache;
+
   const triple = TARGET_TRIPLE_MAP[platform];
   if (!triple) return null;
-  const isWin = platform === "win";
-  const binName = isWin ? "codex.exe" : "codex";
 
-  // 1. Try local node_modules
-  const localPath = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple, "codex", binName);
-  if (fs.existsSync(localPath)) return localPath;
+  const PLAT_PKG = {
+    "linux-x64": "codex-linux-x64", "linux-arm64": "codex-linux-arm64",
+    "mac-arm64": "codex-darwin-arm64", "mac-x64": "codex-darwin-x64", "win": "codex-win32-x64",
+  };
 
-  // 2. npm pack + extract
-  console.log("   [codex] fetching @cometix/codex via npm pack...");
+  // 1. Try node_modules (platform-specific package)
+  const pkg = PLAT_PKG[platform];
+  if (pkg) {
+    const p = path.join(PROJECT_ROOT, "node_modules", "@cometix", pkg, "vendor", triple);
+    if (fs.existsSync(p)) { _vendorRootCache = p; return p; }
+  }
+  // 2. Try old-style vendor
+  const oldPath = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple);
+  if (fs.existsSync(oldPath)) { _vendorRootCache = oldPath; return oldPath; }
+
+  // 3. npm pack platform package
+  const PLAT_SUFFIX = {
+    "linux-x64": "linux-x64", "linux-arm64": "linux-arm64",
+    "mac-arm64": "darwin-arm64", "mac-x64": "darwin-x64", "win": "win32-x64",
+  };
+  const suffix = PLAT_SUFFIX[platform];
+  if (!suffix) return null;
+
+  let baseVer;
+  try {
+    baseVer = execSync("npm view @cometix/codex version", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+  } catch { return null; }
+
+  const spec = `@cometix/codex@${baseVer}-${suffix}`;
+  console.log(`   [vendor] fetching ${spec} via npm pack...`);
   const tmpDir = path.join(require("os").tmpdir(), "cometix-codex-pack");
-  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+  fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-    const tgzName = execSync("npm pack @cometix/codex@latest --pack-destination " + tmpDir, {
+    const tgzName = execSync(`npm pack ${spec} --pack-destination "${tmpDir}"`, {
       cwd: tmpDir, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
     }).trim().split("\n").pop();
 
-    const tgzPath = path.join(tmpDir, tgzName);
     const extractDir = path.join(tmpDir, "extracted");
     if (fs.existsSync(extractDir)) fs.rmSync(extractDir, { recursive: true });
     fs.mkdirSync(extractDir, { recursive: true });
-    execSync(`tar xzf "${tgzPath}" -C "${extractDir}"`, { stdio: "pipe" });
+    execSync(`tar xzf "${path.join(tmpDir, tgzName)}" -C "${extractDir}"`, { stdio: "pipe" });
 
-    const vendorPath = path.join(extractDir, "package", "vendor", triple, "codex", binName);
-    if (fs.existsSync(vendorPath)) return vendorPath;
+    const vendorRoot = path.join(extractDir, "package", "vendor", triple);
+    if (fs.existsSync(vendorRoot)) { _vendorRootCache = vendorRoot; return vendorRoot; }
   } catch (e) {
     console.log(`   [!] npm pack failed: ${e.message}`);
   }
 
   return null;
+}
+
+function resolveCodexVendor(platform) {
+  const vendorRoot = ensureVendorExtracted(platform);
+  if (!vendorRoot) return null;
+  const binName = platform === "win" ? "codex.exe" : "codex";
+  const p = path.join(vendorRoot, "codex", binName);
+  return fs.existsSync(p) ? p : null;
+}
+
+function resolveRgVendor(platform) {
+  const vendorRoot = ensureVendorExtracted(platform);
+  if (!vendorRoot) return null;
+  const binName = platform === "win" ? "rg.exe" : "rg";
+  const p = path.join(vendorRoot, "path", binName);
+  return fs.existsSync(p) ? p : null;
 }
 
 function main() {
@@ -131,6 +172,8 @@ function main() {
   const codexBinName = isWin ? "codex.exe" : "codex";
   const vendorCodex = resolveCodexVendor(platform);
   if (vendorCodex) {
+    // For Linux: put codex in sourceDir (mac-x64/) so it can be found,
+    // but also mark for later copy to forge output.
     const dest = path.join(sourceDir, codexBinName);
     fs.copyFileSync(vendorCodex, dest);
     try { fs.chmodSync(dest, 0o755); } catch {}
@@ -139,21 +182,36 @@ function main() {
     console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
   }
 
-  // 3. Copy to flat src/ for forge
-  // Clear forge-visible dirs
-  for (const d of [".vite", "webview", "skills", "node_modules", "native-menu-locales"]) {
-    const p = path.join(SRC, d);
-    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true });
-  }
-  // Remove loose files in src/ (but keep platform dirs)
-  for (const f of fs.readdirSync(SRC)) {
-    const p = path.join(SRC, f);
-    if (fs.statSync(p).isFile()) fs.unlinkSync(p);
+  // 2b. For Linux: replace rg with platform-native version from @cometix/codex
+  if (isLinux) {
+    const vendorRg = resolveRgVendor(platform);
+    if (vendorRg) {
+      const dest = path.join(sourceDir, "rg");
+      fs.copyFileSync(vendorRg, dest);
+      try { fs.chmodSync(dest, 0o755); } catch {}
+      console.log(`   [rg] replaced with Linux rg from @cometix/codex`);
+    } else {
+      console.log(`   [!] Linux rg not found in vendor, keeping upstream (will fail on Linux)`);
+    }
   }
 
-  // Copy ASAR content to src/ (forge needs this for package.json main entry)
-  const asarCount = copyRecursive(asarContentDir, SRC);
-  console.log(`   [copy] _asar/ -> src/ (${asarCount} files for forge)`)
+  // 3. For Linux: copy _asar/ content to flat src/ (forge packs ASAR from src/)
+  //    Skip node_modules/ — upstream has macOS .node binaries.
+  //    Native modules are rebuilt by electron-rebuild and synced separately.
+  if (isLinux) {
+    // Clear flat src/ dirs
+    for (const d of [".vite", "webview", "skills", "native-menu-locales", "node_modules"]) {
+      const p = path.join(SRC, d);
+      if (fs.existsSync(p)) fs.rmSync(p, { recursive: true });
+    }
+    for (const f of fs.readdirSync(SRC)) {
+      const p = path.join(SRC, f);
+      if (fs.statSync(p).isFile()) fs.unlinkSync(p);
+    }
+    const skipDirs = new Set(["node_modules"]);
+    const count = copyRecursive(asarContentDir, SRC, null, skipDirs);
+    console.log(`   [linux] _asar/ -> src/ (${count} files, skipped node_modules/)`);
+  }
 
   // 4. Sync version to root package.json
   const upstreamPkg = path.join(asarContentDir, "package.json");
@@ -175,6 +233,24 @@ function main() {
     fs.writeFileSync(rootPkgPath, JSON.stringify(rootPkg, null, 2) + "\n");
     console.log(`   version: ${oldVer} -> ${rootPkg.version}`);
   }
+
+  // For mac/win: create stub main entry so forge validation passes.
+  // The real code is in app.asar which we copy in packageAfterCopy.
+  if (!isLinux) {
+    const stubDir = path.join(SRC, ".vite", "build");
+    fs.mkdirSync(stubDir, { recursive: true });
+    fs.writeFileSync(path.join(stubDir, "bootstrap.js"), "// stub - real code in app.asar\n");
+    // Also need package.json in src/ for forge
+    const asarPkg = path.join(asarContentDir, "package.json");
+    if (fs.existsSync(asarPkg)) {
+      fs.copyFileSync(asarPkg, path.join(SRC, "package.json"));
+    }
+  }
+
+  // Write build mode marker for forge.config.js
+  const marker = path.join(SRC, ".build-mode");
+  fs.writeFileSync(marker, isLinux ? "linux" : "upstream-asar");
+  console.log(`   [mode] ${isLinux ? "linux (forge packs ASAR)" : "upstream-asar (pre-built)"}`);
 
   console.log(`   [ok] src/ ready for ${platform} build`);
 }

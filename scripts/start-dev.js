@@ -35,31 +35,45 @@ if (!binDir) {
 }
 
 const cliName = platform === 'win32' ? 'codex.exe' : 'codex';
-const localCliPath = path.join(__dirname, '..', 'resources', 'bin', binDir, cliName);
 
-// 平台 -> target triple 映射（与 forge.config.js 保持一致）
-const TARGET_TRIPLE_MAP = {
-  'darwin-arm64': 'aarch64-apple-darwin',
-  'darwin-x64': 'x86_64-apple-darwin',
-  'linux-arm64': 'aarch64-unknown-linux-musl',
-  'linux-x64': 'x86_64-unknown-linux-musl',
-  'win32-x64': 'x86_64-pc-windows-msvc',
-};
+// Priority: upstream CLI from src/ > @cometix/codex vendor > resources/bin/
+const srcPlatform = platform === 'darwin'
+  ? (arch === 'arm64' ? 'mac-arm64' : 'mac-x64')
+  : platform === 'win32' ? 'win' : `${platform}-${arch}`;
 
-// 从 npm vendor 同步到 resources/bin/
-const triple = TARGET_TRIPLE_MAP[binDir];
-if (triple) {
-  const vendorPath = path.join(__dirname, '..', 'node_modules', '@cometix', 'codex', 'vendor', triple, 'codex', cliName);
-  if (fs.existsSync(vendorPath)) {
-    const localDir = path.join(__dirname, '..', 'resources', 'bin', binDir);
-    fs.mkdirSync(localDir, { recursive: true });
-    fs.copyFileSync(vendorPath, path.join(localDir, cliName));
-    try { fs.chmodSync(path.join(localDir, cliName), 0o755); } catch {}
-    console.log(`[start-dev] Synced codex binary: vendor → resources/bin/${binDir}/${cliName}`);
-  }
-}
+const candidates = [
+  // 1. Upstream CLI (from sync-upstream, matches app version)
+  path.join(__dirname, '..', 'src', srcPlatform, cliName),
+  // 2. @cometix/codex platform package (0.128+ uses separate packages)
+  (() => {
+    const pkgMap = {
+      'darwin-arm64': 'codex-darwin-arm64',
+      'darwin-x64': 'codex-darwin-x64',
+      'linux-arm64': 'codex-linux-arm64',
+      'linux-x64': 'codex-linux-x64',
+      'win32-x64': 'codex-win32-x64',
+    };
+    const tripleMap = {
+      'darwin-arm64': 'aarch64-apple-darwin',
+      'darwin-x64': 'x86_64-apple-darwin',
+      'linux-arm64': 'aarch64-unknown-linux-musl',
+      'linux-x64': 'x86_64-unknown-linux-musl',
+      'win32-x64': 'x86_64-pc-windows-msvc',
+    };
+    const pkg = pkgMap[binDir], triple = tripleMap[binDir];
+    if (!pkg || !triple) return null;
+    // New structure: @cometix/codex-{platform}/vendor/{triple}/codex/codex
+    const newPath = path.join(__dirname, '..', 'node_modules', '@cometix', pkg, 'vendor', triple, 'codex', cliName);
+    if (fs.existsSync(newPath)) return newPath;
+    // Old structure: @cometix/codex/vendor/{triple}/codex/codex
+    const oldPath = path.join(__dirname, '..', 'node_modules', '@cometix', 'codex', 'vendor', triple, 'codex', cliName);
+    return fs.existsSync(oldPath) ? oldPath : null;
+  })(),
+  // 3. Local resources/bin/
+  path.join(__dirname, '..', 'resources', 'bin', binDir, cliName),
+].filter(Boolean);
 
-const cliPath = localCliPath;
+const cliPath = candidates.find(p => fs.existsSync(p));
 
 // Verify CLI exists
 if (!fs.existsSync(cliPath)) {
@@ -68,19 +82,23 @@ if (!fs.existsSync(cliPath)) {
   process.exit(1);
 }
 
+// Resolve app entry: prefer platform-specific _asar/ (has its own package.json)
+const appRoot = path.join(__dirname, '..', 'src', srcPlatform, '_asar');
+const appEntry = fs.existsSync(appRoot) ? appRoot : path.join(__dirname, '..');
+
 console.log(`[start-dev] Platform: ${platform}, Arch: ${arch}`);
 console.log(`[start-dev] CLI Path: ${cliPath}`);
+console.log(`[start-dev] App Root: ${appEntry}`);
 
 // Launch Electron with CLI path
 const electronBin = require('electron');
-const child = spawn(electronBin, ['.'], {
+const child = spawn(electronBin, [appEntry], {
   cwd: path.join(__dirname, '..'),
   stdio: 'inherit',
   env: {
     ...process.env,
     CODEX_CLI_PATH: cliPath,
     BUILD_FLAVOR: process.env.BUILD_FLAVOR || 'dev',
-    // 使用 app:// 自定义协议加载静态资源（而非 Vite dev server）
     ELECTRON_RENDERER_URL: process.env.ELECTRON_RENDERER_URL || 'app://-/index.html',
   },
 });
