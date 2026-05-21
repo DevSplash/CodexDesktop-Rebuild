@@ -1,7 +1,7 @@
 {
   "name": "codex-rebuild",
   "productName": "Codex",
-  "version": "26.513.20950",
+  "version": "26.513.31313",
   "description": "Codex Electron App - Cross-platform Build",
   "main": "src/.vite/build/bootstrap.js",
   "scripts": {
@@ -40,7 +40,7 @@
     "@electron/fuses": "^1.8.0",
     "@electron/rebuild": "^3.7.1",
     "acorn": "^8.16.0",
-    "electron": "^41.2.0",
+    "electron": "^42.0.1",
     "fast-xml-parser": "^5.5.9"
   },
   "dependencies": {

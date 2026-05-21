@@ -1,15 +1,13 @@
 /**
  * Post-build patch: Force-enable i18n by bypassing Statsig cloud control
  *
- * Codex i18n is gated behind Statsig layer 72216192, field "enable_i18n".
- * Even though the default value changed to true in v26.422+, the Statsig
- * server can still push enable_i18n=false to override it.
+ * Codex i18n is gated behind a Statsig layer field "enable_i18n".
+ * The Statsig server can push enable_i18n=false to override the default.
  *
- * This patch uses AST to find all .get("enable_i18n", ...) call expressions
- * within the 72216192 layer context, and replaces the entire ChainExpression
- * or CallExpression with !0, completely bypassing Statsig control.
+ * AST match: any .get("enable_i18n", <default>) call expression
+ * (optionally wrapped in ChainExpression for ?.get), replaced with !0.
  *
- * Target files: index-*.js, general-settings-*.js (varies across versions)
+ * Target files: any chunk containing "enable_i18n" (index-*.js, general-settings-*.js, app-main-*.js)
  *
  * Usage:
  *   node scripts/patch-i18n.js [platform]   # Apply (mac-arm64/mac-x64/win/omit=all)
@@ -43,7 +41,6 @@ function walk(node, visitor) {
 //  AST matching
 // ──────────────────────────────────────────────
 
-const LAYER_ID = "72216192";
 const FIELD_NAME = "enable_i18n";
 
 /**
@@ -51,7 +48,8 @@ const FIELD_NAME = "enable_i18n";
  *   X?.get("enable_i18n", <default>)
  *   X.get("enable_i18n", <default>)
  *
- * Where the containing function also references LAYER_ID "72216192".
+ * AST structural match — no hardcoded layer ID. The .get("enable_i18n", ...)
+ * pattern on a MemberExpression is unique enough.
  *
  * Replace the outermost expression (ChainExpression or CallExpression) with !0.
  */
@@ -93,12 +91,6 @@ function collectPatches(ast, source) {
       : null;
     if (argValue !== FIELD_NAME) return;
 
-    // Context validation: LAYER_ID must appear nearby (within 500 chars)
-    const start = Math.max(0, replaceNode.start - 500);
-    const end = Math.min(source.length, replaceNode.end + 200);
-    const context = source.slice(start, end);
-    if (!context.includes(LAYER_ID)) return;
-
     // Already patched?
     const exprSrc = source.slice(replaceNode.start, replaceNode.end);
     if (exprSrc === "!0") return;
@@ -119,7 +111,7 @@ function collectPatches(ast, source) {
 }
 
 // ──────────────────────────────────────────────
-//  Bundle location: scan all JS chunks for enable_i18n + 72216192
+//  Bundle location: scan all JS chunks for enable_i18n
 // ──────────────────────────────────────────────
 
 function locateTargets(platform) {
@@ -135,19 +127,19 @@ function locateTargets(platform) {
     const indexBundles = locateBundles({ dir: "assets", pattern: /^index-.*\.js$/, platform: plat });
     for (const b of indexBundles) {
       const src = fs.readFileSync(b.path, "utf-8");
-      if (src.includes(FIELD_NAME) && src.includes(LAYER_ID)) {
+      if (src.includes(FIELD_NAME)) {
         targets.push(b);
       }
     }
 
-    // Check general-settings-*.js and other small chunks
+    // Check other chunks (general-settings-*.js, app-main-*.js, etc.)
     const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
     if (!fs.existsSync(assetsDir)) continue;
     for (const f of fs.readdirSync(assetsDir)) {
       if (!f.endsWith(".js") || f.startsWith("index-")) continue;
       const fp = path.join(assetsDir, f);
       const src = fs.readFileSync(fp, "utf-8");
-      if (src.includes(FIELD_NAME) && src.includes(LAYER_ID)) {
+      if (src.includes(FIELD_NAME)) {
         targets.push({ platform: plat, path: fp });
       }
     }
@@ -168,7 +160,7 @@ function main() {
   const targets = locateTargets(platform);
 
   if (targets.length === 0) {
-    console.log("[ok] No files contain enable_i18n + layer 72216192 (upstream may have removed gate)");
+    console.log("[ok] No files contain enable_i18n (upstream may have removed gate)");
     return;
   }
 
