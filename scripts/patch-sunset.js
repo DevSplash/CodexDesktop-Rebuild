@@ -1,14 +1,12 @@
 /**
  * Post-build patch: Disable appSunset forced-update gate
  *
- * Codex uses Statsig gate "2929582856" to control version sunsetting.
+ * Codex uses a Statsig gate to control version sunsetting.
  * When the gate returns true, a full-screen "Update Required" overlay blocks the UI.
  *
- * This script uses AST matching to replace the Cs("2929582856") gate check
- * with !1 (false), so the sunset guard always passes through to normal children.
- *
- * Match pattern:
- *   Functions containing literal "2929582856" -> find Cs(identifier) calls -> replace with !1
+ * AST match: find functions containing the sunset i18n key "appSunset",
+ * then locate gate checker calls identifier(`numericString`) within them,
+ * and replace with !1 (false).
  *
  * Usage:
  *   node scripts/patch-sunset.js [platform]   # Apply patch (unix/win/omit=both)
@@ -44,13 +42,25 @@ function walk(node, visitor, parent) {
 //  Patch rule
 // ──────────────────────────────────────────────
 
-const SUNSET_GATE_ID = "2929582856";
+// Structural markers for sunset functions (i18n keys present in the sunset UI)
+const SUNSET_MARKERS = ["appSunset", "app.sunset", "sunset"];
+
+function getLiteralValue(node) {
+  if (!node) return null;
+  if (node.type === "Literal") return node.value;
+  if (
+    node.type === "TemplateLiteral" &&
+    node.expressions.length === 0 &&
+    node.quasis.length === 1
+  )
+    return node.quasis[0].value.cooked;
+  return null;
+}
 
 function collectPatches(ast, source) {
   const allPatches = [];
 
   walk(ast, (node) => {
-    // Find functions whose body contains the sunset gate ID
     if (
       node.type !== "FunctionDeclaration" &&
       node.type !== "FunctionExpression" &&
@@ -59,21 +69,20 @@ function collectPatches(ast, source) {
       return;
 
     const funcSrc = source.slice(node.start, node.end);
-    if (!funcSrc.includes(SUNSET_GATE_ID)) return;
+    // Structural match: function must contain a sunset-related i18n key
+    if (!SUNSET_MARKERS.some((m) => funcSrc.includes(m))) return;
 
-    // Within this function, find Cs(xxx) calls
+    // Within this function, find gate calls: identifier(`numericString`)
     walk(node, (child) => {
       if (child.type !== "CallExpression") return;
-      const callee = child.callee;
-      if (!callee || callee.type !== "Identifier") return;
-      // Cs is the minified useGateValue — verify by name pattern
-      if (child.arguments.length !== 1) return;
+      if (child.callee?.type !== "Identifier") return;
+      if (child.arguments?.length !== 1) return;
+
+      const argVal = getLiteralValue(child.arguments[0]);
+      if (!argVal || !/^\d{6,}$/.test(argVal)) return;
 
       const callSrc = source.slice(child.start, child.end);
-      if (callSrc === "!1") return; // already patched
-
-      // Verify callee name matches Cs pattern (2-char identifier used as gate checker)
-      if (callee.name.length > 3) return;
+      if (callSrc === "!1") return;
 
       if (!allPatches.some((x) => x.start === child.start)) {
         allPatches.push({
@@ -121,10 +130,10 @@ function main() {
     const patches = collectPatches(ast, source);
 
     if (patches.length === 0) {
-      if (!source.includes(SUNSET_GATE_ID)) {
-        console.log("   [!] Sunset gate ID not found in bundle");
+      if (!SUNSET_MARKERS.some((m) => source.includes(m))) {
+        console.log("   [!] No sunset markers found in bundle");
       } else {
-        console.log("   [ok] Sunset gate already disabled");
+        console.log("   [ok] Sunset gate already disabled or no gate call found");
       }
       continue;
     }

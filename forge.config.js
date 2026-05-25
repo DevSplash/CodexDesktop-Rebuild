@@ -105,9 +105,8 @@ module.exports = {
       console.log(`\n-- packageAfterCopy: ${platform}-${arch}`);
 
       const resourcesPath = path.dirname(buildPath);
-      const platformKey = platform === "win32" ? "win"
-        : platform === "linux" ? `mac-${arch}`
-        : `mac-${arch}`;
+      const isLinux = platform === "linux";
+      const platformKey = platform === "win32" ? "win" : `mac-${arch}`;
 
       const platformDir = path.join(__dirname, "src", platformKey);
       if (!fs.existsSync(platformDir)) {
@@ -115,10 +114,20 @@ module.exports = {
         return;
       }
 
-      // Keep buildPath (app/) with package.json — forge needs it after this hook.
-      // Our app.asar goes alongside it in Resources/.
-
-      const skip = new Set(["_asar"]); // _asar is working dir, already repacked into app.asar
+      // Skip _asar (already repacked into app.asar or packed by forge for Linux).
+      // For Linux: also skip macOS-only binaries and app.asar (forge packs its own).
+      const skip = new Set(["_asar"]);
+      const MACOS_ONLY_FILES = new Set([
+        "node", "node_repl",
+        "electron.icns", "Assets.car",
+        "codexTemplate.png", "codexTemplate@2x.png",
+        "app.asar", "codex-notification.wav",
+      ]);
+      const MACOS_ONLY_DIRS = new Set(["native", "app.asar.unpacked"]);
+      if (isLinux) {
+        for (const f of MACOS_ONLY_FILES) skip.add(f);
+        for (const d of MACOS_ONLY_DIRS) skip.add(d);
+      }
       let copied = 0;
 
       const copyDir = (s, d) => {
