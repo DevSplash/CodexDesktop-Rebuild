@@ -1,3 +1,7 @@
+/**
+ * Install Linux Codex resources that exactly match a desktop-bundled Codex
+ * binary. Windows and macOS must keep their official desktop resource sets.
+ */
 const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
@@ -6,16 +10,14 @@ const { execFileSync } = require("child_process");
 
 const RELEASE_API = "https://api.github.com/repos/openai/codex/releases";
 const CHECKSUM_ASSET = "codex-package_SHA256SUMS";
+const VERSION_PATTERN =
+  /(^|[^0-9A-Za-z])(\d+\.\d+\.\d+(?:-[A-Za-z][A-Za-z0-9-]*\.\d+(?:\.\d+)*)?)/g;
+const VERSION_SCAN_CHUNK_SIZE = 4 * 1024 * 1024;
+const VERSION_SCAN_OVERLAP = 256;
+const RELEASES_PER_PAGE = 30;
+const MAX_RELEASE_PAGES = 6;
 
 const PLATFORM_CONFIG = {
-  "mac-arm64": {
-    target: "aarch64-apple-darwin",
-    executableSuffix: "",
-  },
-  "mac-x64": {
-    target: "x86_64-apple-darwin",
-    executableSuffix: "",
-  },
   "linux-arm64": {
     target: "aarch64-unknown-linux-musl",
     executableSuffix: "",
@@ -24,17 +26,9 @@ const PLATFORM_CONFIG = {
     target: "x86_64-unknown-linux-musl",
     executableSuffix: "",
   },
-  win: {
-    target: "x86_64-pc-windows-msvc",
-    executableSuffix: ".exe",
-  },
-  "win-arm64": {
-    target: "aarch64-pc-windows-msvc",
-    executableSuffix: ".exe",
-  },
 };
 
-let releaseCache;
+const releaseCache = new Map();
 const packageCache = new Map();
 
 function curlText(url) {
@@ -47,7 +41,7 @@ function curlText(url) {
     url,
   ], {
     encoding: "utf-8",
-    maxBuffer: 8 * 1024 * 1024,
+    maxBuffer: 64 * 1024 * 1024,
   });
 }
 
@@ -66,25 +60,129 @@ function normalizeReleaseTag(tag) {
   return tag.startsWith("rust-v") ? tag : `rust-v${tag.replace(/^v/, "")}`;
 }
 
-function getRelease() {
-  if (releaseCache) return releaseCache;
+function detectBundledCodexVersions(binaryPath) {
+  if (!binaryPath || !fs.existsSync(binaryPath)) {
+    throw new Error(`Bundled desktop Codex binary is missing: ${binaryPath}`);
+  }
 
-  const requestedTag = normalizeReleaseTag(process.env.OPENAI_CODEX_RELEASE_TAG?.trim());
-  const url = requestedTag
-    ? `${RELEASE_API}/tags/${encodeURIComponent(requestedTag)}`
-    : `${RELEASE_API}/latest`;
-  const release = JSON.parse(curlText(url));
+  const versions = new Set();
+  const fd = fs.openSync(binaryPath, "r");
+  let overlap = "";
+  try {
+    const buffer = Buffer.allocUnsafe(VERSION_SCAN_CHUNK_SIZE);
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
 
+      const text = overlap + buffer.subarray(0, bytesRead).toString("latin1");
+      VERSION_PATTERN.lastIndex = 0;
+      let match;
+      while ((match = VERSION_PATTERN.exec(text)) !== null) {
+        versions.add(match[2]);
+      }
+      overlap = text.slice(-VERSION_SCAN_OVERLAP);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  return [...versions];
+}
+
+function fetchRelease(tag) {
+  if (releaseCache.has(tag)) return releaseCache.get(tag);
+
+  const release = JSON.parse(
+    curlText(`${RELEASE_API}/tags/${encodeURIComponent(tag)}`),
+  );
+  return cacheRelease(release);
+}
+
+function cacheRelease(release) {
   if (!release.tag_name || !Array.isArray(release.assets)) {
     throw new Error("Invalid response from the openai/codex releases API");
   }
-  if (release.draft || release.prerelease) {
-    throw new Error(`Refusing non-stable openai/codex release: ${release.tag_name}`);
+  if (release.draft) {
+    throw new Error(`Refusing draft openai/codex release: ${release.tag_name}`);
   }
 
-  const version = release.tag_name.replace(/^rust-v/, "");
-  releaseCache = { ...release, version };
-  return releaseCache;
+  const resolved = {
+    ...release,
+    version: release.tag_name.replace(/^rust-v/, ""),
+  };
+  releaseCache.set(release.tag_name, resolved);
+  return resolved;
+}
+
+function hasPackageAsset(release, platform) {
+  const platformConfig = PLATFORM_CONFIG[platform];
+  if (!platformConfig) return false;
+  const archiveName = `codex-package-${platformConfig.target}.tar.gz`;
+  return release.assets.some((asset) => asset.name === archiveName)
+    && release.assets.some((asset) => asset.name === CHECKSUM_ASSET);
+}
+
+function getRelease(bundledCodexPath, platform) {
+  const detectedVersions = detectBundledCodexVersions(bundledCodexPath);
+  if (detectedVersions.length === 0) {
+    throw new Error(
+      `Could not detect a Codex version in the desktop binary: ${bundledCodexPath}`,
+    );
+  }
+
+  const requestedTag = normalizeReleaseTag(
+    process.env.OPENAI_CODEX_RELEASE_TAG?.trim(),
+  );
+  if (requestedTag) {
+    const requestedVersion = requestedTag.replace(/^rust-v/, "");
+    if (!detectedVersions.includes(requestedVersion)) {
+      throw new Error(
+        `OPENAI_CODEX_RELEASE_TAG ${requestedTag} does not match the bundled `
+        + `desktop Codex binary at ${bundledCodexPath}`,
+      );
+    }
+    const release = fetchRelease(requestedTag);
+    if (!hasPackageAsset(release, platform)) {
+      throw new Error(
+        `Release ${requestedTag} has no complete package for ${platform}`,
+      );
+    }
+    return release;
+  }
+
+  const detectedSet = new Set(detectedVersions);
+  for (let page = 1; page <= MAX_RELEASE_PAGES; page++) {
+    const releases = JSON.parse(
+      curlText(
+        `${RELEASE_API}?per_page=${RELEASES_PER_PAGE}&page=${page}`,
+      ),
+    );
+    if (!Array.isArray(releases)) {
+      throw new Error("Invalid response from the openai/codex releases API");
+    }
+
+    for (const candidate of releases) {
+      if (
+        candidate.draft
+        || !candidate.tag_name?.startsWith("rust-v")
+        || !Array.isArray(candidate.assets)
+      ) {
+        continue;
+      }
+      const version = candidate.tag_name.replace(/^rust-v/, "");
+      if (detectedSet.has(version) && hasPackageAsset(candidate, platform)) {
+        return cacheRelease(candidate);
+      }
+    }
+    if (releases.length < RELEASES_PER_PAGE) break;
+  }
+
+  throw new Error(
+    `No openai/codex release matches the bundled desktop binary. `
+    + `Found ${detectedVersions.length} version-like strings in ${bundledCodexPath}. `
+    + `Checked the newest ${RELEASES_PER_PAGE * MAX_RELEASE_PAGES} releases; `
+    + "set OPENAI_CODEX_RELEASE_TAG only as an exact-match override.",
+  );
 }
 
 function findAsset(release, name) {
@@ -138,15 +236,23 @@ function findPackageRoot(extractDir) {
   return null;
 }
 
-function resolveCodexPackage(platform) {
-  if (packageCache.has(platform)) return packageCache.get(platform);
-
+function resolveCodexPackage(platform, bundledCodexPath) {
+  if (!platform.startsWith("linux-")) {
+    throw new Error(
+      `Official desktop resources must be preserved for ${platform}; `
+      + "release substitution is only supported for Linux",
+    );
+  }
   const platformConfig = PLATFORM_CONFIG[platform];
   if (!platformConfig) {
     throw new Error(`Unsupported Codex release platform: ${platform}`);
   }
 
-  const release = getRelease();
+  const release = getRelease(bundledCodexPath, platform);
+  const packageCacheKey = `${release.tag_name}/${platform}`;
+  if (packageCache.has(packageCacheKey)) {
+    return packageCache.get(packageCacheKey);
+  }
   const archiveName = `codex-package-${platformConfig.target}.tar.gz`;
   const archiveAsset = findAsset(release, archiveName);
   const expectedSha256 = getExpectedSha256(release, archiveName);
@@ -216,7 +322,7 @@ function resolveCodexPackage(platform) {
     platformConfig,
     release,
   };
-  packageCache.set(platform, resolved);
+  packageCache.set(packageCacheKey, resolved);
   return resolved;
 }
 
@@ -251,8 +357,12 @@ function copyResourceTree(sourceDir, destinationDir, relativeDir = "") {
   return copied;
 }
 
-function installCodexReleaseResources(platform, resourcesDir) {
-  const resolved = resolveCodexPackage(platform);
+function installCodexReleaseResources(
+  platform,
+  resourcesDir,
+  bundledCodexPath,
+) {
+  const resolved = resolveCodexPackage(platform, bundledCodexPath);
   const {
     archiveName,
     expectedSha256,
@@ -307,6 +417,7 @@ function installCodexReleaseResources(platform, resourcesDir) {
 
 module.exports = {
   PLATFORM_CONFIG,
+  detectBundledCodexVersions,
   getRelease,
   installCodexReleaseResources,
   resolveCodexPackage,

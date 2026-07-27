@@ -30,12 +30,14 @@ npm run build:linux-arm64
 npm run build:all
 ```
 
-Each build resolves one latest stable
-[openai/codex release](https://github.com/openai/codex/releases), verifies the
-official SHA-256 manifest, and installs the matching CLI resource set for the
-target platform. Set `OPENAI_CODEX_RELEASE_TAG=rust-vX.Y.Z` to pin a release.
-The packaged `resources/codex-release.json` records the exact source asset and
-digest.
+macOS and Windows builds preserve the complete native resource set bundled by
+the official desktop package. Linux has no official desktop package, so its
+build detects the Codex version embedded in the matching macOS bundle, downloads
+that exact [openai/codex release](https://github.com/openai/codex/releases),
+verifies the official SHA-256 manifest, and installs its Linux resource set.
+`OPENAI_CODEX_RELEASE_TAG=rust-vX.Y.Z` is accepted only when it exactly matches
+the bundled desktop binary. Linux packages include
+`resources/codex-release.json` with the source asset and digest.
 
 ## Development
 

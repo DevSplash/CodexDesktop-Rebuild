@@ -14,30 +14,9 @@ env:
   NODE_VERSION: "24"
 
 jobs:
-  resolve_codex_release:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.release.outputs.tag }}
-    steps:
-      - name: Resolve latest stable openai/codex release
-        id: release
-        shell: bash
-        run: |
-          TAG="$(curl -fsSL --retry 3 \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'User-Agent: CodexDesktop-Rebuild' \
-            https://api.github.com/repos/openai/codex/releases/latest \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
-          test -n "$TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Using openai/codex $TAG"
-
   build-mac:
-    needs: resolve_codex_release
     if: inputs.platform == 'all' || inputs.platform == 'mac'
     runs-on: macos-latest
-    env:
-      OPENAI_CODEX_RELEASE_TAG: ${{ needs.resolve_codex_release.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,11 +40,8 @@ jobs:
           path: out/*.dmg
 
   build-windows:
-    needs: resolve_codex_release
     if: inputs.platform == 'all' || inputs.platform == 'windows'
     runs-on: windows-latest
-    env:
-      OPENAI_CODEX_RELEASE_TAG: ${{ needs.resolve_codex_release.outputs.tag }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -89,11 +65,8 @@ jobs:
           path: out/*.zip
 
   build-linux:
-    needs: resolve_codex_release
     if: inputs.platform == 'all' || inputs.platform == 'linux'
     runs-on: ubuntu-latest
-    env:
-      OPENAI_CODEX_RELEASE_TAG: ${{ needs.resolve_codex_release.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:

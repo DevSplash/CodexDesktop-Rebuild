@@ -1,6 +1,13 @@
 const { FuseV1Options, FuseVersion } = require("@electron/fuses");
 const path = require("path");
 const fs = require("fs");
+const {
+  isForeignLinuxBinary,
+  isMacBundleDirectory,
+} = require("./scripts/linux-resource-filter");
+const {
+  installCodexReleaseResources,
+} = require("./scripts/openai-codex-release");
 
 module.exports = {
   packagerConfig: {
@@ -115,47 +122,47 @@ module.exports = {
       }
 
       // Skip _asar (already repacked into app.asar or packed by forge for Linux).
-      // For Linux: also skip macOS-only binaries and app.asar (forge packs its own).
+      // For Linux: skip desktop binaries that are replaced by the exact matching
+      // Linux release, plus resources that Forge rebuilds for Linux.
       const skip = new Set(["_asar"]);
       const MACOS_ONLY_FILES = new Set([
         "node", "node_repl",
         "electron.icns", "Assets.car",
-        "codexTemplate.png", "codexTemplate@2x.png",
-        "app.asar", "codex-notification.wav",
+        "app.asar",
       ]);
       const MACOS_ONLY_DIRS = new Set(["native", "app.asar.unpacked"]);
+      const LINUX_RELEASE_FILES = new Set([
+        "codex",
+        "codex-code-mode-host",
+        "rg",
+        "bwrap",
+        "zsh",
+        "codex-release.json",
+      ]);
       if (isLinux) {
         for (const f of MACOS_ONLY_FILES) skip.add(f);
         for (const d of MACOS_ONLY_DIRS) skip.add(d);
+        for (const f of LINUX_RELEASE_FILES) skip.add(f);
       }
       let copied = 0;
-      let skippedForeignArch = 0;
+      let skippedForeignBinaries = 0;
+      let skippedMacBundles = 0;
 
-      const isForeignLinuxBinary = (filePath) => {
-        if (!isLinux) return false;
-
-        const relativePath = path.relative(platformDir, filePath).split(path.sep).join("/");
-        if (!relativePath.includes("/@oai/sky/bin/linux/")) return false;
-
-        const fileName = path.basename(filePath).toLowerCase();
-        const foreignArchNames = arch === "x64"
-          ? ["arm64", "aarch64"]
-          : arch === "arm64"
-            ? ["x64", "amd64", "x86_64"]
-            : [];
-        return foreignArchNames.some((name) => fileName.includes(name));
-      };
-
-      const copyDir = (s, d) => {
-        fs.mkdirSync(d, { recursive: true });
+      const copyDir = (s, d, filterForeignBinaries = false) => {
         for (const e of fs.readdirSync(s, { withFileTypes: true })) {
           const sp = path.join(s, e.name), dp = path.join(d, e.name);
-          if (e.isDirectory()) copyDir(sp, dp);
-          else if (!e.isSymbolicLink()) {
-            if (isForeignLinuxBinary(sp)) {
-              skippedForeignArch++;
+          if (e.isDirectory()) {
+            if (filterForeignBinaries && isMacBundleDirectory(e.name)) {
+              skippedMacBundles++;
               continue;
             }
+            copyDir(sp, dp, filterForeignBinaries);
+          } else if (!e.isSymbolicLink()) {
+            if (filterForeignBinaries && isForeignLinuxBinary(sp)) {
+              skippedForeignBinaries++;
+              continue;
+            }
+            fs.mkdirSync(path.dirname(dp), { recursive: true });
             fs.copyFileSync(sp, dp);
             copied++;
           }
@@ -170,17 +177,56 @@ module.exports = {
         const destPath = path.join(resourcesPath, entry.name);
 
         if (entry.isDirectory()) {
-          copyDir(srcPath, destPath);
+          if (isLinux && isMacBundleDirectory(entry.name)) {
+            skippedMacBundles++;
+            continue;
+          }
+          copyDir(srcPath, destPath, isLinux);
         } else if (!entry.isSymbolicLink()) {
+          if (isLinux && isForeignLinuxBinary(srcPath)) {
+            skippedForeignBinaries++;
+            continue;
+          }
+          fs.mkdirSync(path.dirname(destPath), { recursive: true });
           fs.copyFileSync(srcPath, destPath);
           try { fs.chmodSync(destPath, 0o755); } catch {}
           copied++;
         }
       }
 
-      console.log(`   [ok] ${copied} files (app.asar + unpacked + resources)`);
-      if (skippedForeignArch > 0) {
-        console.log(`   [skip] ${skippedForeignArch} foreign-architecture Linux binaries`);
+      if (isLinux) {
+        installCodexReleaseResources(
+          `linux-${arch}`,
+          resourcesPath,
+          path.join(platformDir, "codex"),
+        );
+        const requiredLinuxResources = [
+          "codex",
+          "codex-code-mode-host",
+          "rg",
+          "bwrap",
+          path.join("zsh", "bin", "zsh"),
+          "codex-release.json",
+        ];
+        for (const relativePath of requiredLinuxResources) {
+          const resourcePath = path.join(resourcesPath, relativePath);
+          if (!fs.existsSync(resourcePath)) {
+            throw new Error(
+              `Matching Linux Codex package is missing ${relativePath}`,
+            );
+          }
+          if (relativePath !== "codex-release.json") {
+            try { fs.chmodSync(resourcePath, 0o755); } catch {}
+          }
+        }
+      }
+
+      console.log(`   [ok] ${copied} resource files copied`);
+      if (skippedForeignBinaries > 0) {
+        console.log(`   [skip] ${skippedForeignBinaries} non-Linux/foreign-architecture binaries`);
+      }
+      if (skippedMacBundles > 0) {
+        console.log(`   [skip] ${skippedMacBundles} macOS bundle directories`);
       }
     },
   },

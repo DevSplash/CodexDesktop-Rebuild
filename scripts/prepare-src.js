@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * Pre-build: Repack patched ASAR, replace Codex CLI resources, assemble for forge.
+ * Pre-build: Repack patched ASAR and assemble for forge.
  *
  * Flow:
  *   1. Repack _asar/ -> app.asar (with patches applied)
- *   2. Replace Codex CLI resources with the latest official openai/codex release
- *   3. Copy everything to src/ for forge (app.asar + unpacked + resources)
+ *   2. Copy everything to src/ for forge
  *
- * For Linux: strip macOS-only resources, add official Linux Codex resources
+ * Windows and macOS builds preserve the official desktop bundle's resources.
+ * Forge installs exact matching Linux Codex resources into the final package.
  *
  * Usage:
  *   node scripts/prepare-src.js --platform mac-arm64
@@ -16,18 +16,9 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { installCodexReleaseResources } = require("./openai-codex-release");
 
 const SRC = path.join(__dirname, "..", "src");
 const PROJECT_ROOT = path.join(__dirname, "..");
-
-// macOS-only resources to strip for Linux
-const MACOS_STRIP = new Set([
-  "codex_chronicle", "node", "node_repl",
-  "electron.icns", "Assets.car",
-  "codexTemplate.png", "codexTemplate@2x.png",
-]);
-const MACOS_STRIP_DIRS = new Set(["native"]);
 
 function copyRecursive(src, dest, skipFiles, skipDirs) {
   fs.mkdirSync(dest, { recursive: true });
@@ -80,8 +71,13 @@ function main() {
   const asarSize = (fs.statSync(repackedAsar).size / 1048576).toFixed(1);
   console.log(`   [ok] app.asar: ${asarSize} MB`);
 
-  // 2. Install a complete, version-matched official Codex resource set.
-  installCodexReleaseResources(platform, sourceDir);
+  // 2. Do not mutate the desktop resource set. Forge installs the exact Linux
+  // release directly into the final Resources directory.
+  if (isLinux) {
+    console.log("   [resources] exact Linux release will be installed by Forge");
+  } else {
+    console.log("   [resources] preserving official desktop bundle");
+  }
 
   // 3. For Linux: copy _asar/ content to flat src/ (forge packs ASAR from src/)
   //    Skip node_modules/ — upstream has macOS .node binaries.

@@ -3,8 +3,8 @@
  * build-from-upstream.js — Patch upstream Codex and repackage
  *
  * For macOS and Windows: no forge needed.
- * Takes the upstream app, patches ASAR in-place, replaces Codex CLI resources,
- * and outputs a distributable.
+ * Takes the upstream app, patches ASAR in-place, preserves the desktop bundle's
+ * native resources, and outputs a distributable.
  *
  * Usage:
  *   node scripts/build-from-upstream.js --platform mac-arm64
@@ -14,7 +14,6 @@
 const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
-const { installCodexReleaseResources } = require("./openai-codex-release");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SRC_DIR = path.join(PROJECT_ROOT, "src");
@@ -110,8 +109,8 @@ function buildMac(platform) {
   try { execSync(`codesign --remove-signature "${outApp}"`, { stdio: "pipe" }); } catch {}
   try { execSync(`xattr -rd com.apple.quarantine "${outApp}"`, { stdio: "pipe" }); } catch {}
 
-  // 6. Replace all version-coupled CLI resources from one official release.
-  installCodexReleaseResources(platform, resourcesDir);
+  // 6. Keep the complete CLI/helper resource set from the official desktop
+  // bundle. These binaries are version-coupled to the app-server protocol.
 
   // 7. Ad-hoc re-sign (prevents "damaged app" Gatekeeper error)
   console.log("   [codesign] ad-hoc signing");
@@ -185,8 +184,8 @@ function buildWin(platform) {
     }
   }
 
-  // Replace all version-coupled CLI resources from one official release.
-  installCodexReleaseResources(platform, resourcesDir);
+  // Keep the complete CLI/helper resource set from the official MSIX. These
+  // binaries are version-coupled to the app-server protocol.
 
   // Create ZIP
   const version = getVersion(asarDir);
