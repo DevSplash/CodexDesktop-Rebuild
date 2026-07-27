@@ -11,10 +11,10 @@
  * Optional env override:
  *   CODEX_PROXY_CONFIG_PATH=C:\path\to\config.toml
  *
- * The injected code runs in bootstrap.js before app.whenReady(), so
- * Electron command-line proxy switches are applied early. It also exports
- * HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY for Node and child
- * processes that inherit process.env.
+ * The injected code runs at the start of package.json#main, before
+ * app.whenReady(), so Electron command-line proxy switches are applied
+ * early. It also exports HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY
+ * for Node and child processes that inherit process.env.
  */
 const fs = require("fs");
 const path = require("path");
@@ -108,76 +108,67 @@ const INJECTED = String.raw`
 })();
 `.trim();
 
-function buildDirsForPlatform(platform) {
-  const platforms = platform
-    ? [platform]
-    : ["mac-arm64", "mac-x64", "win"].filter((p) =>
-        fs.existsSync(path.join(SRC_DIR, p)),
-      );
-
-  const dirs = [];
-  for (const plat of platforms) {
-    for (const rel of [
-      [".vite", "build"],
-      ["src", ".vite", "build"],
-    ]) {
-      const dir = path.join(SRC_DIR, plat, ...rel);
-      if (fs.existsSync(dir)) dirs.push({ platform: plat, dir });
-    }
-  }
-
-  // Flat prepared src/ fallback.
-  for (const rel of [
-    [".vite", "build"],
-    ["src", ".vite", "build"],
-  ]) {
-    const dir = path.join(SRC_DIR, ...rel);
-    if (fs.existsSync(dir)) dirs.push({ platform: "legacy", dir });
-  }
-
-  return dirs;
+function selectedPlatforms(platform) {
+  if (platform === "unix") return ["mac-arm64", "mac-x64"];
+  if (platform) return [platform];
+  return ["mac-arm64", "mac-x64", "win"];
 }
 
-function locateBootstraps(platform) {
+function resolvePackageEntrypoint(rootDir) {
+  const packagePath = path.join(rootDir, "package.json");
+  if (!fs.existsSync(packagePath)) return null;
+
+  const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+  if (typeof pkg.main !== "string" || pkg.main.trim().length === 0) {
+    throw new Error(`${relPath(packagePath)} has no main entrypoint`);
+  }
+
+  const entrypoint = path.resolve(rootDir, pkg.main.trim());
+  const relative = path.relative(rootDir, entrypoint);
+  if (
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error(`${relPath(packagePath)} main escapes its package: ${pkg.main}`);
+  }
+  if (!fs.existsSync(entrypoint)) {
+    throw new Error(`${relPath(packagePath)} main not found: ${pkg.main}`);
+  }
+  return entrypoint;
+}
+
+function locateEntrypoints(platform) {
   const targets = [];
   const seen = new Set();
-  for (const { platform: plat, dir } of buildDirsForPlatform(platform)) {
-    const file = path.join(dir, "bootstrap.js");
-    if (!fs.existsSync(file)) continue;
-    const real = path.resolve(file);
-    if (seen.has(real)) continue;
-    seen.add(real);
-    targets.push({ platform: plat, path: file });
-  }
 
-  // Fallback for upstream layout changes. Keep it conservative:
-  // bootstrap.js is the Electron entrypoint, and this patch is idempotent.
-  function walk(dir) {
-    if (!fs.existsSync(dir)) return;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (entry.name === "node_modules" || entry.name === "app.asar.unpacked") continue;
-        walk(full);
-        continue;
-      }
-      if (entry.isFile() && entry.name === "bootstrap.js") {
-        const real = path.resolve(full);
-        if (seen.has(real)) continue;
+  for (const plat of selectedPlatforms(platform)) {
+    const platformDir = path.join(SRC_DIR, plat);
+    if (!fs.existsSync(platformDir)) continue;
+
+    for (const rootDir of [
+      path.join(platformDir, "_asar"),
+      platformDir,
+    ]) {
+      const entrypoint = resolvePackageEntrypoint(rootDir);
+      if (!entrypoint) continue;
+      const real = path.resolve(entrypoint);
+      if (!seen.has(real)) {
         seen.add(real);
-        targets.push({ platform: platform || "auto", path: full });
+        targets.push({ platform: plat, path: entrypoint });
       }
+      break;
     }
   }
-  if (targets.length === 0) {
-    const fallbackRoot = platform ? path.join(SRC_DIR, platform) : SRC_DIR;
-    walk(fallbackRoot);
-  }
 
+  if (targets.length === 0) {
+    const entrypoint = resolvePackageEntrypoint(SRC_DIR);
+    if (entrypoint) targets.push({ platform: "legacy", path: entrypoint });
+  }
   return targets;
 }
 
-function patchSource(source) {
+function patchSource(source, allowPrepend = false) {
   if (source.includes(MARKER)) {
     const start = source.indexOf("/* " + MARKER + " */");
     const end = source.indexOf("})();", start);
@@ -198,6 +189,15 @@ function patchSource(source) {
     return {
       code: `${source.slice(0, start)}${INJECTED}${source.slice(blockEnd)}`,
       status: "updated",
+    };
+  }
+
+  // package.json#main is always a CommonJS Electron entrypoint. Prepending is
+  // more stable than matching minified or hashed bootstrap implementation code.
+  if (allowPrepend) {
+    return {
+      code: `${INJECTED}\n${source}`,
+      status: "patched",
     };
   }
 
@@ -228,26 +228,30 @@ function patchSource(source) {
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
-  const platform = args.find((a) => ["mac-arm64", "mac-x64", "win"].includes(a));
+  const platform = args.find((a) =>
+    ["mac-arm64", "mac-x64", "win", "unix"].includes(a),
+  );
 
-  const targets = locateBootstraps(platform);
+  const targets = locateEntrypoints(platform);
   if (targets.length === 0) {
-    console.log("[ok] No bootstrap.js found; skipping proxy config patch");
-    return;
+    console.error("[x] Electron package entrypoint not found; proxy patch not applied");
+    process.exit(1);
   }
 
   let patchedCount = 0;
+  let failedCount = 0;
   for (const target of targets) {
     console.log(`\n-- [${target.platform}] ${relPath(target.path)}`);
     const source = fs.readFileSync(target.path, "utf8");
-    const result = patchSource(source);
+    const result = patchSource(source, true);
 
     if (result.status === "already") {
       console.log("   [ok] Proxy config patch already injected");
       continue;
     }
     if (result.status === "no-match") {
-      console.log("   [!] bootstrap injection point not found");
+      console.log("   [x] entrypoint injection failed");
+      failedCount++;
       continue;
     }
 
@@ -264,8 +268,16 @@ function main() {
   }
 
   if (isCheck && patchedCount > 0) {
-    console.log(`\n=> Total: ${patchedCount} patchable bootstrap file(s)`);
+    console.log(`\n=> Total: ${patchedCount} patchable entrypoint file(s)`);
   }
+  if (failedCount > 0) process.exit(1);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  INJECTED,
+  locateEntrypoints,
+  patchSource,
+  resolvePackageEntrypoint,
+};
