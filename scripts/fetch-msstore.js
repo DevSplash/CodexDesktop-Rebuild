@@ -18,6 +18,7 @@ const tls = require("tls");
 const { XMLParser } = require("fast-xml-parser");
 const fs = require("fs");
 const path = require("path");
+const { selectPackageForArchitecture } = require("./msstore-package");
 
 // ─── 补充微软 WU 服务的证书链 ────────────────────────────────────
 // 微软 fe3.delivery.mp.microsoft.com 服务端不发送中间 CA 证书，
@@ -614,7 +615,13 @@ async function main() {
 }
 
 // 支持作为模块导入
-module.exports = { getCookie, getAppInfo, getFileList, getDownloadUrl };
+module.exports = {
+  getCookie,
+  getAppInfo,
+  getFileList,
+  getDownloadUrl,
+  selectPackageForArchitecture,
+};
 
 // CLI 直接运行
 if (require.main === module) {

@@ -113,8 +113,9 @@ async function checkWindowsVersion() {
     throw new Error("MS Store 未返回任何包");
   }
 
+  // Store 返回顺序不稳定，ARM64 包可能排在 x64 前；必须显式选择 x64。
+  const pkg = msstore.selectPackageForArchitecture(packages, "x64");
   // 从包名提取版本: OpenAI.Codex_26.325.2171.0_x64__xxx.msix
-  const pkg = packages[0];
   const versionMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
   const version = versionMatch ? versionMatch[1] : "unknown";
 
