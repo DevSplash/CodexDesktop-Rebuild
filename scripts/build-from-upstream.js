@@ -111,17 +111,21 @@ function buildMac(platform) {
     process.exit(1);
   }
 
-  // 1. Find the .app in the ZIP extract cache
+  // 1. Use the .app saved by sync-upstream. Temp directories can be cleaned
+  // between GitHub Actions steps, so only use the extract cache as a fallback.
+  const cachedApp = path.join(platformDir, "Codex.app");
+  let appPath = fs.existsSync(cachedApp) ? cachedApp : null;
+
+  // Find the .app in the ZIP extract cache for local syncs made before the
+  // persistent cache was introduced.
   const tempDir = path.join(require("os").tmpdir(), "codex-sync");
   const variant = platform === "mac-arm64" ? "arm64" : "x64";
   const extractDir = path.join(tempDir, `${variant}-extract`);
 
-  // Find Codex.app
-  let appPath = null;
-  if (fs.existsSync(extractDir)) {
+  if (!appPath && fs.existsSync(extractDir)) {
     const findApp = (dir) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (e.name === "Codex.app" && e.isDirectory()) return path.join(dir, e.name);
+        if (e.name.toLowerCase().endsWith(".app") && e.isDirectory()) return path.join(dir, e.name);
         if (e.isDirectory()) { const r = findApp(path.join(dir, e.name)); if (r) return r; }
       }
       return null;

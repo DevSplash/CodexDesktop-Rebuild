@@ -221,7 +221,14 @@ function main() {
     const rootPkg = JSON.parse(fs.readFileSync(rootPkgPath, "utf-8"));
     const oldVer = rootPkg.version;
     rootPkg.version = upstream.version || rootPkg.version;
-    rootPkg.main = "src/.vite/build/bootstrap.js";
+    const upstreamMain = String(upstream.main || ".vite/build/bootstrap.js")
+      .replace(/\\/g, "/")
+      .replace(/^\.?\//, "");
+    const generatedMain = path.join(SRC, ...upstreamMain.split("/"));
+    if (!fs.existsSync(generatedMain)) {
+      throw new Error(`Upstream main entry not found: ${upstreamMain}`);
+    }
+    rootPkg.main = path.posix.join("src", upstreamMain);
     for (const key of [
       "codexBuildNumber", "codexBuildFlavor",
       "codexSparkleFeedUrl", "codexSparklePublicKey",

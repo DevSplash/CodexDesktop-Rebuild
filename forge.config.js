@@ -129,13 +129,36 @@ module.exports = {
         for (const d of MACOS_ONLY_DIRS) skip.add(d);
       }
       let copied = 0;
+      let skippedForeignArch = 0;
+
+      const isForeignLinuxBinary = (filePath) => {
+        if (!isLinux) return false;
+
+        const relativePath = path.relative(platformDir, filePath).split(path.sep).join("/");
+        if (!relativePath.includes("/@oai/sky/bin/linux/")) return false;
+
+        const fileName = path.basename(filePath).toLowerCase();
+        const foreignArchNames = arch === "x64"
+          ? ["arm64", "aarch64"]
+          : arch === "arm64"
+            ? ["x64", "amd64", "x86_64"]
+            : [];
+        return foreignArchNames.some((name) => fileName.includes(name));
+      };
 
       const copyDir = (s, d) => {
         fs.mkdirSync(d, { recursive: true });
         for (const e of fs.readdirSync(s, { withFileTypes: true })) {
           const sp = path.join(s, e.name), dp = path.join(d, e.name);
           if (e.isDirectory()) copyDir(sp, dp);
-          else if (!e.isSymbolicLink()) { fs.copyFileSync(sp, dp); copied++; }
+          else if (!e.isSymbolicLink()) {
+            if (isForeignLinuxBinary(sp)) {
+              skippedForeignArch++;
+              continue;
+            }
+            fs.copyFileSync(sp, dp);
+            copied++;
+          }
         }
       };
 
@@ -156,6 +179,9 @@ module.exports = {
       }
 
       console.log(`   [ok] ${copied} files (app.asar + unpacked + resources)`);
+      if (skippedForeignArch > 0) {
+        console.log(`   [skip] ${skippedForeignArch} foreign-architecture Linux binaries`);
+      }
     },
   },
 };

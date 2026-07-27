@@ -27,12 +27,17 @@ const SRC_MODULES = path.join(SRC, "node_modules");
 
 const MACOS_ONLY = new Set(["objc-js"]);
 
-function copyRecursive(src, dest) {
+function copyRecursive(src, dest, shouldSkip = () => false, relativeDir = "") {
   fs.mkdirSync(dest, { recursive: true });
   let count = 0;
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
+    const relativePath = path.join(relativeDir, e.name);
+    if (shouldSkip(relativePath, e)) continue;
+
     const s = path.join(src, e.name), d = path.join(dest, e.name);
-    if (e.isDirectory()) { count += copyRecursive(s, d); }
+    if (e.isDirectory()) {
+      count += copyRecursive(s, d, shouldSkip, relativePath);
+    }
     else if (e.isSymbolicLink()) { /* skip */ }
     else { fs.copyFileSync(s, d); count++; }
   }
@@ -109,7 +114,22 @@ function main() {
     }
 
     const destDir = path.join(SRC_MODULES, mod);
-    const count = copyRecursive(source, destDir);
+    // better-sqlite3 ships prebuilds for both Linux architectures. Keep the
+    // target architecture only, otherwise rpmbuild tries to strip a foreign ELF.
+    const skipForeignPrebuilds = (relativePath, entry) => {
+      if (mod !== "better-sqlite3" || entry.isDirectory()) return false;
+
+      const normalizedPath = relativePath.split(path.sep).join("/");
+      if (!normalizedPath.startsWith("prebuilds/")) return false;
+
+      const fileName = path.basename(relativePath).toLowerCase();
+      return platform === "linux-x64"
+        ? fileName.includes("arm64") || fileName.includes("aarch64")
+        : platform === "linux-arm64"
+          ? fileName.includes("x64") || fileName.includes("amd64") || fileName.includes("x86_64")
+          : false;
+    };
+    const count = copyRecursive(source, destDir, skipForeignPrebuilds);
     totalCopied += count;
     console.log(`   [${sourceLabel}] ${mod} (${count} files)`);
   }

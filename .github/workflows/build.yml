@@ -28,7 +28,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: |
-          npm ci
+          npm ci --ignore-scripts
       - run: |
           brew install --quiet sevenzip
       - run: node scripts/sync-upstream.js --force --skip-win
@@ -49,7 +49,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: |
-          npm ci
+          npm ci --ignore-scripts
       - run: |
           choco install 7zip -y
       - name: Add 7zz alias
@@ -78,7 +78,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: |
-          npm ci
+          npm ci --ignore-scripts
       - run: |
           sudo apt-get update
           sudo apt-get install -y rpm fakeroot dpkg 7zip

@@ -177,6 +177,28 @@ async function syncMac(variant, appcastUrl, destDir) {
   if (!resourcesDir) throw new Error(`${label}: Resources directory not found`);
 
   assembleOutput(resourcesDir, destDir, label);
+
+  // build-from-upstream needs the original .app bundle for its executable and
+  // frameworks. Runner temp directories are not guaranteed to persist across
+  // workflow steps, so keep a local generated copy on macOS.
+  if (process.platform === "darwin") {
+    let appPath = path.resolve(resourcesDir);
+    while (path.extname(appPath).toLowerCase() !== ".app") {
+      const parent = path.dirname(appPath);
+      if (parent === appPath) {
+        appPath = null;
+        break;
+      }
+      appPath = parent;
+    }
+    if (!appPath) {
+      throw new Error(`${label}: application bundle not found above Resources`);
+    }
+    const cachedApp = path.join(destDir, "Codex.app");
+    console.log(`   [cache] ${path.basename(appPath)} -> source directory/Codex.app`);
+    execSync(`ditto "${appPath}" "${cachedApp}"`);
+  }
+
   return info;
 }
 
