@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has_update: ${{ steps.detect.outputs.has_update }}
+      codex_release_tag: ${{ steps.codex_release.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -30,6 +31,19 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --ignore-scripts
+
+      - name: Resolve latest stable openai/codex release
+        id: codex_release
+        shell: bash
+        run: |
+          TAG="$(curl -fsSL --retry 3 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: CodexDesktop-Rebuild' \
+            https://api.github.com/repos/openai/codex/releases/latest \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+          test -n "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using openai/codex $TAG"
 
       - name: Check upstream versions
         id: detect
@@ -56,6 +70,8 @@ jobs:
     needs: check
     if: needs.check.outputs.has_update == 'true'
     runs-on: macos-latest
+    env:
+      OPENAI_CODEX_RELEASE_TAG: ${{ needs.check.outputs.codex_release_tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -98,6 +114,8 @@ jobs:
     needs: check
     if: needs.check.outputs.has_update == 'true'
     runs-on: windows-latest
+    env:
+      OPENAI_CODEX_RELEASE_TAG: ${{ needs.check.outputs.codex_release_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -141,6 +159,8 @@ jobs:
     needs: check
     if: needs.check.outputs.has_update == 'true'
     runs-on: ubuntu-latest
+    env:
+      OPENAI_CODEX_RELEASE_TAG: ${{ needs.check.outputs.codex_release_tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -187,7 +207,7 @@ jobs:
   # Bump version + tag + release
   # ──────────────────────────────────────────────
   release:
-    needs: [build-mac, build-windows, build-linux]
+    needs: [check, build-mac, build-windows, build-linux]
     if: always() && needs.check.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -260,6 +280,7 @@ jobs:
             | macOS x64 | `${{ steps.version.outputs.mac_x64 || 'N/A' }}` |
             | Windows x64 | `${{ steps.version.outputs.win_version || 'N/A' }}` |
             | Linux | uses macOS ASAR |
+            | Codex CLI resources | `${{ needs.check.outputs.codex_release_tag }}` |
           files: |
             artifacts/**/*.dmg
             artifacts/**/*.zip

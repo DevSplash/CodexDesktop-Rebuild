@@ -36,49 +36,26 @@ if (!binDir) {
 
 const cliName = platform === 'win32' ? 'codex.exe' : 'codex';
 
-// Priority: upstream CLI from src/ > @cometix/codex vendor > resources/bin/
+// Priority: explicit override > synced platform resources > local resources/bin/
 const srcPlatform = platform === 'darwin'
   ? (arch === 'arm64' ? 'mac-arm64' : 'mac-x64')
-  : platform === 'win32' ? 'win' : `${platform}-${arch}`;
+  : platform === 'linux'
+    ? (arch === 'arm64' ? 'mac-arm64' : 'mac-x64')
+    : 'win';
 
 const candidates = [
-  // 1. Upstream CLI (from sync-upstream, matches app version)
+  process.env.CODEX_CLI_PATH,
+  // Official CLI copied into the platform resources during preparation.
   path.join(__dirname, '..', 'src', srcPlatform, cliName),
-  // 2. @cometix/codex platform package (0.128+ uses separate packages)
-  (() => {
-    const pkgMap = {
-      'darwin-arm64': 'codex-darwin-arm64',
-      'darwin-x64': 'codex-darwin-x64',
-      'linux-arm64': 'codex-linux-arm64',
-      'linux-x64': 'codex-linux-x64',
-      'win32-x64': 'codex-win32-x64',
-    };
-    const tripleMap = {
-      'darwin-arm64': 'aarch64-apple-darwin',
-      'darwin-x64': 'x86_64-apple-darwin',
-      'linux-arm64': 'aarch64-unknown-linux-musl',
-      'linux-x64': 'x86_64-unknown-linux-musl',
-      'win32-x64': 'x86_64-pc-windows-msvc',
-    };
-    const pkg = pkgMap[binDir], triple = tripleMap[binDir];
-    if (!pkg || !triple) return null;
-    // New structure: @cometix/codex-{platform}/vendor/{triple}/codex/codex
-    const newPath = path.join(__dirname, '..', 'node_modules', '@cometix', pkg, 'vendor', triple, 'codex', cliName);
-    if (fs.existsSync(newPath)) return newPath;
-    // Old structure: @cometix/codex/vendor/{triple}/codex/codex
-    const oldPath = path.join(__dirname, '..', 'node_modules', '@cometix', 'codex', 'vendor', triple, 'codex', cliName);
-    return fs.existsSync(oldPath) ? oldPath : null;
-  })(),
-  // 3. Local resources/bin/
+  // Local development fallback.
   path.join(__dirname, '..', 'resources', 'bin', binDir, cliName),
 ].filter(Boolean);
 
 const cliPath = candidates.find(p => fs.existsSync(p));
 
 // Verify CLI exists
-if (!fs.existsSync(cliPath)) {
-  console.error(`CLI not found at: ${cliPath}`);
-  console.error('Tried: resources/bin/ and node_modules/@cometix/codex/vendor/');
+if (!cliPath) {
+  console.error('CLI not found in CODEX_CLI_PATH, src platform resources, or resources/bin/');
   process.exit(1);
 }
 

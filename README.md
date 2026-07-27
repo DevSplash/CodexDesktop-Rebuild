@@ -30,6 +30,13 @@ npm run build:linux-arm64
 npm run build:all
 ```
 
+Each build resolves one latest stable
+[openai/codex release](https://github.com/openai/codex/releases), verifies the
+official SHA-256 manifest, and installs the matching CLI resource set for the
+target platform. Set `OPENAI_CODEX_RELEASE_TAG=rust-vX.Y.Z` to pin a release.
+The packaged `resources/codex-release.json` records the exact source asset and
+digest.
+
 ## Development
 
 ```bash
@@ -62,7 +69,7 @@ GitHub Actions automatically builds on:
 **© OpenAI · Cometix Space**
 
 - [OpenAI Codex](https://github.com/openai/codex) - Original Codex CLI (Apache-2.0)
-- [Cometix Space](https://github.com/Haleclipse) - Cross-platform rebuild & [@cometix/codex](https://www.npmjs.com/package/@cometix/codex) binaries
+- [Cometix Space](https://github.com/Haleclipse) - Cross-platform rebuild
 - [Electron Forge](https://www.electronforge.io/) - Build toolchain
 
 ## License

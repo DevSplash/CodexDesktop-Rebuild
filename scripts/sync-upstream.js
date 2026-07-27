@@ -6,8 +6,8 @@
  *   src/{platform}/
  *     _asar/              Extracted app.asar content (patch target)
  *     app.asar.unpacked/  Native modules (kept as-is from upstream)
- *     codex|codex.exe     CLI binary (will be replaced by @cometix/codex)
- *     rg|rg.exe           ripgrep binary (kept from upstream)
+ *     codex|codex.exe     CLI binary (replaced from the official Codex release)
+ *     rg|rg.exe           ripgrep binary (replaced from the official Codex release)
  *     plugins/            Bundled plugins
  *     native/             Platform native modules
  *     ...                 All other upstream resources
