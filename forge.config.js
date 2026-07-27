@@ -158,7 +158,7 @@ module.exports = {
             }
             copyDir(sp, dp, filterForeignBinaries);
           } else if (!e.isSymbolicLink()) {
-            if (filterForeignBinaries && isForeignLinuxBinary(sp)) {
+            if (filterForeignBinaries && isForeignLinuxBinary(sp, arch)) {
               skippedForeignBinaries++;
               continue;
             }
@@ -183,7 +183,7 @@ module.exports = {
           }
           copyDir(srcPath, destPath, isLinux);
         } else if (!entry.isSymbolicLink()) {
-          if (isLinux && isForeignLinuxBinary(srcPath)) {
+          if (isLinux && isForeignLinuxBinary(srcPath, arch)) {
             skippedForeignBinaries++;
             continue;
           }
