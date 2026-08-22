@@ -166,15 +166,64 @@ function makeGetUrlSoap(updateID, revisionNumber, ring) {
 }
 
 // ─── HTTP 辅助 ───────────────────────────────────────────────────
+// Windows GitHub runners often stall on IPv6 to Microsoft WU hosts, then hit
+// the old 30s timeout. Force IPv4, wait longer, and retry transient failures.
+
+const REQUEST_TIMEOUT_MS = 120000;
+const REQUEST_RETRIES = 3;
+
+function isRetryableNetworkError(err) {
+  const msg = String(err && err.message ? err.message : err);
+  const code = err && err.code ? String(err.code) : "";
+  return /timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ENETUNREACH|EHOSTUNREACH|EPIPE|socket hang up/i.test(
+    `${code} ${msg}`
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function httpsRequest(url, options = {}) {
+  return requestWithRetry(url, options, REQUEST_RETRIES);
+}
+
+async function requestWithRetry(url, options, retries) {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await httpsRequestOnce(url, options);
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableNetworkError(err) || attempt === retries) throw err;
+      const delay = 1000 * attempt;
+      console.warn(
+        `    [retry ${attempt}/${retries}] ${err.message}; waiting ${delay}ms`
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
+
+function httpsRequestOnce(url, options = {}) {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
+    const timeoutMs = options.timeoutMs || REQUEST_TIMEOUT_MS;
     const reqOpts = {
       hostname: urlObj.hostname,
       path: urlObj.pathname + urlObj.search,
       method: options.method || "GET",
       headers: options.headers || {},
+      family: 4,
+      timeout: timeoutMs,
+    };
+
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
     };
 
     const req = https.request(reqOpts, (res) => {
@@ -182,14 +231,24 @@ function httpsRequest(url, options = {}) {
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
         const body = Buffer.concat(chunks).toString("utf-8");
-        resolve({ status: res.statusCode, headers: res.headers, body });
+        finish(resolve, {
+          status: res.statusCode,
+          headers: res.headers,
+          body,
+        });
       });
+      res.on("error", (err) => finish(reject, err));
     });
 
-    req.on("error", reject);
-    req.setTimeout(30000, () => {
-      req.destroy(new Error("Request timeout"));
+    req.on("error", (err) => finish(reject, err));
+    req.on("timeout", () => {
+      req.destroy(
+        new Error(
+          `Request timeout after ${timeoutMs}ms: ${reqOpts.method} ${urlObj.hostname}`
+        )
+      );
     });
+    req.setTimeout(timeoutMs);
 
     if (options.body) req.write(options.body);
     req.end();

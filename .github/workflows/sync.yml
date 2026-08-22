@@ -188,7 +188,7 @@ jobs:
   # ──────────────────────────────────────────────
   release:
     needs: [check, build-mac, build-windows, build-linux]
-    if: always() && needs.check.result == 'success'
+    if: ${{ !cancelled() && needs.check.result == 'success' && needs.build-mac.result == 'success' && needs.build-windows.result == 'success' && needs.build-linux.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

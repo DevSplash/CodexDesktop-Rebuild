@@ -204,10 +204,10 @@ async function syncMac(variant, appcastUrl, destDir) {
 
 // ─── Extract Windows ────────────────────────────────────────────
 
-async function syncWin(destDir) {
+async function syncWin(destDir, cachedInfo) {
   console.log("\n-- Windows");
 
-  const info = await getWindowsVersion();
+  const info = cachedInfo && cachedInfo.url ? cachedInfo : await getWindowsVersion();
   console.log(`   version: ${info.version}`);
 
   const msixPath = path.join(TEMP_DIR, info.packageName || `codex-win-${info.version}.msix`);
@@ -286,11 +286,19 @@ function saveVersions(v) {
 
 // ─── Main ───────────────────────────────────────────────────────
 
+function requiredPlatforms() {
+  const required = [];
+  if (!SKIP_MAC) required.push("mac-arm64", "mac-x64");
+  if (!SKIP_WIN) required.push("win");
+  return required;
+}
+
 async function main() {
   console.log("== Codex upstream sync ==\n");
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 
   const results = {};
+  const failures = [];
 
   // Detect versions
   if (!SKIP_MAC) {
@@ -298,13 +306,19 @@ async function main() {
       const arm64Info = await getAppcastVersion(APPCAST_ARM64);
       console.log(`\n   mac-arm64: ${arm64Info.version} (build ${arm64Info.build})`);
       results["mac-arm64"] = arm64Info;
-    } catch (e) { console.error(`   [x] mac-arm64 check: ${e.message}`); }
+    } catch (e) {
+      console.error(`   [x] mac-arm64 check: ${e.message}`);
+      failures.push(`mac-arm64 check: ${e.message}`);
+    }
 
     try {
       const x64Info = await getAppcastVersion(APPCAST_X64);
       console.log(`   mac-x64:   ${x64Info.version} (build ${x64Info.build})`);
       results["mac-x64"] = x64Info;
-    } catch (e) { console.error(`   [x] mac-x64 check: ${e.message}`); }
+    } catch (e) {
+      console.error(`   [x] mac-x64 check: ${e.message}`);
+      failures.push(`mac-x64 check: ${e.message}`);
+    }
   }
 
   if (!SKIP_WIN) {
@@ -312,29 +326,52 @@ async function main() {
       const winInfo = await getWindowsVersion();
       console.log(`   win:       ${winInfo.version}`);
       results.win = winInfo;
-    } catch (e) { console.error(`   [x] win check: ${e.message}`); }
+    } catch (e) {
+      console.error(`   [x] win check: ${e.message}`);
+      failures.push(`win check: ${e.message}`);
+    }
   }
 
+  const missing = requiredPlatforms().filter((key) => !results[key]);
   if (CHECK_ONLY) {
     console.log("\n== Check only, skipping download ==");
+    if (missing.length) {
+      throw new Error(`Required upstream check failed (${missing.join(", ")}): ${failures.join("; ")}`);
+    }
     return;
+  }
+
+  if (missing.length) {
+    throw new Error(`Required upstream check failed (${missing.join(", ")}): ${failures.join("; ")}`);
   }
 
   // Download and extract
   if (!SKIP_MAC && results["mac-arm64"]) {
     try {
       results["mac-arm64"] = await syncMac("arm64", APPCAST_ARM64, path.join(SRC_DIR, "mac-arm64"));
-    } catch (e) { console.error(`   [x] mac-arm64: ${e.message}`); }
+    } catch (e) {
+      console.error(`   [x] mac-arm64: ${e.message}`);
+      failures.push(`mac-arm64: ${e.message}`);
+      delete results["mac-arm64"];
+    }
   }
   if (!SKIP_MAC && results["mac-x64"]) {
     try {
       results["mac-x64"] = await syncMac("x64", APPCAST_X64, path.join(SRC_DIR, "mac-x64"));
-    } catch (e) { console.error(`   [x] mac-x64: ${e.message}`); }
+    } catch (e) {
+      console.error(`   [x] mac-x64: ${e.message}`);
+      failures.push(`mac-x64: ${e.message}`);
+      delete results["mac-x64"];
+    }
   }
   if (!SKIP_WIN && results.win) {
     try {
-      results.win = await syncWin(path.join(SRC_DIR, "win"));
-    } catch (e) { console.error(`   [x] win: ${e.message}`); }
+      results.win = await syncWin(path.join(SRC_DIR, "win"), results.win);
+    } catch (e) {
+      console.error(`   [x] win: ${e.message}`);
+      failures.push(`win: ${e.message}`);
+      delete results.win;
+    }
   }
 
   const saved = loadVersions();
@@ -342,6 +379,11 @@ async function main() {
     saved[key] = { version: info.version, build: info.build || "", checkedAt: new Date().toISOString() };
   }
   saveVersions(saved);
+
+  const missingAfterSync = requiredPlatforms().filter((key) => !results[key]);
+  if (missingAfterSync.length) {
+    throw new Error(`Required upstream sync failed (${missingAfterSync.join(", ")}): ${failures.join("; ")}`);
+  }
 
   console.log("\n== Done ==");
   for (const [key, info] of Object.entries(results)) {
