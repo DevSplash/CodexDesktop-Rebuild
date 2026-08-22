@@ -84,6 +84,29 @@ function extractArchive(archive, dest) {
   }
 }
 
+function decodeAppxNames(root) {
+  // MSIX zip entries percent-encode '@' as %40 (also $ and +). Store install
+  // decodes them; 7-Zip/tar do not, so asar then looks for @worklouder and fails.
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) walk(path.join(dir, entry.name));
+    }
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      let decoded;
+      try { decoded = decodeURIComponent(entry.name); } catch { continue; }
+      if (decoded === entry.name) continue;
+      const from = path.join(dir, entry.name);
+      const to = path.join(dir, decoded);
+      if (fs.existsSync(to)) {
+        console.warn(`   [warn] encoded path collision: ${entry.name} -> ${decoded}`);
+        continue;
+      }
+      fs.renameSync(from, to);
+    }
+  };
+  walk(root);
+}
+
 function findFile(dir, name) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, e.name);
@@ -222,6 +245,7 @@ async function syncWin(destDir, cachedInfo) {
   console.log("   [unzip]");
   clearDir(extractDir);
   extractArchive(msixPath, extractDir);
+  decodeAppxNames(extractDir);
 
   const resourcesDir = path.join(extractDir, "app", "resources");
   if (!fs.existsSync(resourcesDir)) {
