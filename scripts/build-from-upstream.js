@@ -175,13 +175,7 @@ function buildWin(platform) {
   console.log(`   [integrity] new hash: ${newHash.slice(0, 16)}...`);
 
   if (oldHash !== newHash) {
-    // Find Codex.exe in app root
-    const exePath = path.join(outApp, "Codex.exe");
-    if (fs.existsSync(exePath)) {
-      patchExeHash(exePath, oldHash, newHash);
-    } else {
-      console.log("   [!] Codex.exe not found for hash patching");
-    }
+    patchWindowsAsarIntegrity(outApp, oldHash, newHash);
   }
 
   // Keep the complete CLI/helper resource set from the official MSIX. These
@@ -211,14 +205,54 @@ function computeAsarHeaderHash(asarPath) {
 function patchExeHash(exePath, oldHash, newHash) {
   const buf = fs.readFileSync(exePath);
   const oldBuf = Buffer.from(oldHash, "ascii");
-  const idx = buf.indexOf(oldBuf);
-  if (idx < 0) {
-    console.log("   [!] old hash not found in exe");
-    return;
+  const newBuf = Buffer.from(newHash, "ascii");
+  let count = 0;
+  let offset = 0;
+
+  for (
+    let idx = buf.indexOf(oldBuf, offset);
+    idx >= 0;
+    idx = buf.indexOf(oldBuf, offset)
+  ) {
+    newBuf.copy(buf, idx);
+    count++;
+    offset = idx + oldBuf.length;
   }
-  Buffer.from(newHash, "ascii").copy(buf, idx);
+
+  if (count === 0) return 0;
+
   fs.writeFileSync(exePath, buf);
-  console.log(`   [integrity] exe hash patched at offset ${idx}`);
+  console.log(`   [integrity] ${path.basename(exePath)}: patched ${count} hash occurrence(s)`);
+  return count;
+}
+
+function patchWindowsAsarIntegrity(appDir, oldHash, newHash) {
+  // Newer MSIX packages use ChatGPT.exe as the Electron host and keep
+  // Codex.exe as a launcher. Locate the host by its embedded hash instead of
+  // assuming either executable name.
+  const executables = fs.readdirSync(appDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".exe"))
+    .map((entry) => path.join(appDir, entry.name));
+
+  let patchedFiles = 0;
+  let patchedOccurrences = 0;
+  for (const exePath of executables) {
+    const count = patchExeHash(exePath, oldHash, newHash);
+    if (count > 0) {
+      patchedFiles++;
+      patchedOccurrences += count;
+    }
+  }
+
+  if (patchedFiles === 0) {
+    throw new Error(
+      `ASAR integrity hash ${oldHash} was not found in any top-level Windows executable`,
+    );
+  }
+
+  console.log(
+    `   [integrity] patched ${patchedOccurrences} occurrence(s) in ${patchedFiles} executable(s)`,
+  );
 }
 
 function updateAsarIntegrity(asarPath, infoPlistPath) {
@@ -268,4 +302,10 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  computeAsarHeaderHash,
+  patchExeHash,
+  patchWindowsAsarIntegrity,
+};
