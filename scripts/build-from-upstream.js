@@ -226,6 +226,61 @@ function patchExeHash(exePath, oldHash, newHash) {
   return count;
 }
 
+const ELECTRON_FUSE_SENTINEL = Buffer.from(
+  "dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX",
+  "ascii",
+);
+const EMBEDDED_ASAR_INTEGRITY_FUSE_INDEX = 4;
+const FUSE_STATE_DISABLED = 0x30;
+
+function readElectronFuseWire(binaryPath) {
+  const buf = fs.readFileSync(binaryPath);
+  const sentinelOffset = buf.indexOf(ELECTRON_FUSE_SENTINEL);
+  if (sentinelOffset < 0) return null;
+
+  const headerOffset = sentinelOffset + ELECTRON_FUSE_SENTINEL.length;
+  if (headerOffset + 2 > buf.length) {
+    throw new Error(`Truncated Electron fuse header in ${binaryPath}`);
+  }
+
+  const version = buf[headerOffset];
+  const length = buf[headerOffset + 1];
+  const wireOffset = headerOffset + 2;
+  if (wireOffset + length > buf.length) {
+    throw new Error(`Truncated Electron fuse wire in ${binaryPath}`);
+  }
+
+  return {
+    version,
+    states: buf.subarray(wireOffset, wireOffset + length),
+  };
+}
+
+function findWindowsAsarIntegrityFuse(appDir) {
+  // Component-based Windows builds keep Electron's fuse wire in chrome.dll;
+  // older layouts may keep it in the main executable. Check both forms.
+  const candidates = fs.readdirSync(appDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.(?:dll|exe)$/i.test(entry.name))
+    .sort((a, b) => Number(b.name.toLowerCase() === "chrome.dll") - Number(a.name.toLowerCase() === "chrome.dll"));
+
+  for (const entry of candidates) {
+    const binaryPath = path.join(appDir, entry.name);
+    const wire = readElectronFuseWire(binaryPath);
+    if (!wire) continue;
+
+    if (wire.version !== 1 || wire.states.length <= EMBEDDED_ASAR_INTEGRITY_FUSE_INDEX) {
+      throw new Error(`Unsupported Electron fuse wire in ${binaryPath}`);
+    }
+
+    return {
+      binaryPath,
+      state: wire.states[EMBEDDED_ASAR_INTEGRITY_FUSE_INDEX],
+    };
+  }
+
+  return null;
+}
+
 function patchWindowsAsarIntegrity(appDir, oldHash, newHash) {
   // Newer MSIX packages use ChatGPT.exe as the Electron host and keep
   // Codex.exe as a launcher. Locate the host by its embedded hash instead of
@@ -245,6 +300,14 @@ function patchWindowsAsarIntegrity(appDir, oldHash, newHash) {
   }
 
   if (patchedFiles === 0) {
+    const fuse = findWindowsAsarIntegrityFuse(appDir);
+    if (fuse?.state === FUSE_STATE_DISABLED) {
+      console.log(
+        `   [integrity] ${path.basename(fuse.binaryPath)}: embedded ASAR integrity is disabled; hash patch not required`,
+      );
+      return;
+    }
+
     throw new Error(
       `ASAR integrity hash ${oldHash} was not found in any top-level Windows executable`,
     );
@@ -306,6 +369,8 @@ if (require.main === module) main();
 
 module.exports = {
   computeAsarHeaderHash,
+  findWindowsAsarIntegrityFuse,
   patchExeHash,
   patchWindowsAsarIntegrity,
+  readElectronFuseWire,
 };
