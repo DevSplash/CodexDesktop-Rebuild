@@ -5,7 +5,7 @@
  * Supported config:
  *   [proxy]
  *   enabled = true
- *   server = "http://127.0.0.1:7890"
+ *   server = "http://127.0.0.1:7890" # also supports socks5:// and socks5h://
  *   bypass = "localhost,127.0.0.1,<local>"
  *
  * Optional env override:
@@ -66,6 +66,10 @@ const INJECTED = String.raw`
     var os=require("node:os"), path=require("node:path");
     return path.join(os.homedir(),".codex");
   }
+  function electronProxyServer(server){
+    // Chromium resolves SOCKS5 hostnames remotely but does not accept socks5h.
+    return String(server).replace(/^socks5h:\/\//i,"socks5://");
+  }
   function loadProxyConfig(){
     var fs=require("node:fs"), path=require("node:path");
     var cfgPath=(process.env.CODEX_PROXY_CONFIG_PATH&&process.env.CODEX_PROXY_CONFIG_PATH.trim())||path.join(codexHome(),"config.toml");
@@ -74,8 +78,10 @@ const INJECTED = String.raw`
     if(!parseBool(cfg.enabled)) return null;
     var server=cfg.server||cfg.proxy||cfg.url||cfg.all_proxy||cfg.https_proxy||cfg.http_proxy;
     if(!server) return null;
+    server=String(server).trim();
     return {
-      server:String(server).trim(),
+      server:server,
+      electronServer:electronProxyServer(server),
       bypass:String(cfg.bypass||cfg.no_proxy||cfg.noProxy||"").trim()
     };
   }
@@ -93,12 +99,12 @@ const INJECTED = String.raw`
       process.env.no_proxy=process.env.no_proxy||cfg.bypass;
     }
     var electron=require("electron");
-    electron.app.commandLine.appendSwitch("proxy-server",cfg.server);
+    electron.app.commandLine.appendSwitch("proxy-server",cfg.electronServer);
     if(cfg.bypass) electron.app.commandLine.appendSwitch("proxy-bypass-list",cfg.bypass);
     electron.app.once("ready",function(){
       try{
         electron.session.defaultSession.setProxy({
-          proxyRules: cfg.server,
+          proxyRules: cfg.electronServer,
           proxyBypassRules: cfg.bypass
         }).catch(function(e){ console.warn("[Codex Proxy] setProxy failed:",e); });
       }catch(e){ console.warn("[Codex Proxy] session proxy failed:",e); }
