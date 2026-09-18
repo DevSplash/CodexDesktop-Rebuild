@@ -171,6 +171,8 @@ function makeGetUrlSoap(updateID, revisionNumber, ring) {
 
 const REQUEST_TIMEOUT_MS = 120000;
 const REQUEST_RETRIES = 3;
+const DOWNLOAD_URL_RETRIES = 5;
+const DOWNLOAD_URL_RETRY_BASE_MS = 2000;
 
 function isRetryableNetworkError(err) {
   const msg = String(err && err.message ? err.message : err);
@@ -406,16 +408,8 @@ async function getFileList(cookie, categoryId, ring) {
   return updates;
 }
 
-async function getDownloadUrl(updateID, revisionNumber, ring, digest) {
-  const soap = makeGetUrlSoap(updateID, revisionNumber, ring);
-  const res = await soapPost(
-    "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx/secured",
-    soap
-  );
-
-  if (res.status !== 200) return "";
-
-  const parsed = parseXml(res.body);
+function extractDownloadUrl(xml, digest) {
+  const parsed = parseXml(xml);
   const locations = deepFindAll(parsed, "FileLocation");
 
   for (const loc of locations) {
@@ -431,6 +425,46 @@ async function getDownloadUrl(updateID, revisionNumber, ring, digest) {
   }
 
   return "";
+}
+
+async function getDownloadUrl(updateID, revisionNumber, ring, digest) {
+  const soap = makeGetUrlSoap(updateID, revisionNumber, ring);
+  let lastFailure = "response contained no FileLocation URL";
+  let attemptsUsed = 0;
+
+  for (let attempt = 1; attempt <= DOWNLOAD_URL_RETRIES; attempt++) {
+    attemptsUsed = attempt;
+    const res = await soapPost(
+      "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx/secured",
+      soap
+    );
+    const url = res.status === 200 ? extractDownloadUrl(res.body, digest) : "";
+    if (url) return url;
+
+    lastFailure =
+      res.status === 200
+        ? "HTTP 200 response contained no FileLocation URL"
+        : `HTTP ${res.status}`;
+
+    const retryable =
+      res.status === 200 ||
+      res.status === 408 ||
+      res.status === 429 ||
+      res.status >= 500;
+    if (!retryable || attempt === DOWNLOAD_URL_RETRIES) break;
+
+    const delay = DOWNLOAD_URL_RETRY_BASE_MS * 2 ** (attempt - 1);
+    console.warn(
+      `    [retry ${attempt}/${DOWNLOAD_URL_RETRIES}] ` +
+        `download URL unavailable (${lastFailure}); waiting ${delay}ms`
+    );
+    await sleep(delay);
+  }
+
+  throw new Error(
+    `GetExtendedUpdateInfo2 returned no download URL for update ${updateID} ` +
+      `after ${attemptsUsed} attempt(s) (${lastFailure})`
+  );
 }
 
 // ─── 深度搜索辅助 ────────────────────────────────────────────────
@@ -675,6 +709,7 @@ async function main() {
 
 // 支持作为模块导入
 module.exports = {
+  extractDownloadUrl,
   getCookie,
   getAppInfo,
   getFileList,

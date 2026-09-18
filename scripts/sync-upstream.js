@@ -21,7 +21,7 @@ const tls = require("tls");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync, execSync } = require("child_process");
 
 // TLS certs for MS delivery CDN
 const certsDir = path.join(__dirname, "certs");
@@ -62,8 +62,22 @@ function httpGet(url) {
 }
 
 function curlDownload(url, dest, label) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${label}: missing or invalid download URL`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`${label}: unsupported download URL protocol ${parsed.protocol}`);
+  }
+
   console.log(`  [dl] ${label}`);
-  execSync(`curl -L --retry 3 --retry-delay 2 -o "${dest}" "${url}"`, { stdio: "inherit" });
+  execFileSync(
+    "curl",
+    ["-L", "--fail", "--retry", "3", "--retry-delay", "2", "-o", dest, url],
+    { stdio: "inherit" },
+  );
 }
 
 function extractArchive(archive, dest) {
@@ -170,6 +184,7 @@ async function getWindowsVersion() {
   if (pkgs.length === 0) throw new Error("No packages");
   const pkg = msstore.selectPackageForArchitecture(pkgs, "x64");
   const url = await msstore.getDownloadUrl(pkg.updateID, pkg.revisionNumber, "Retail", pkg.digest);
+  if (!url) throw new Error(`No download URL for ${pkg.name}`);
   const verMatch = pkg.name.match(/_(\d+\.\d+\.\d+(?:\.\d+)?)_/);
   return { version: verMatch?.[1] || "unknown", url, packageName: pkg.name };
 }
