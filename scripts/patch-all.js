@@ -21,6 +21,7 @@ const PATCHES = [
   "patch-windows-portable-core.js",
   "patch-updater.js",
   "patch-archive-delete.js",
+  "patch-luna-reserve.js",
 ];
 
 function main() {
