@@ -6,6 +6,10 @@
  * replaces the picker with one Reserve row and sends that hidden selector for
  * every selection.
  *
+ * Also keeps the gpt-reserve quota row visible under the remaining-usage menu
+ * even when the current session model is an ordinary model. Upstream filters
+ * additional rate limits to the selected model only.
+ *
  * The bundle is minified and variable names change between releases, so this
  * patch intentionally matches the surrounding expression shape instead of
  * relying on a particular generated name.
@@ -21,6 +25,7 @@ const { relPath, SRC_DIR } = require("./patch-util");
 const IDENT = "[A-Za-z_$][A-Za-z0-9_$]*";
 const MARKER = "/* Codex Luna Reserve picker patch */";
 const CORE_MARKER = "/* Codex Luna Reserve core patch */";
+const USAGE_MARKER = "/* Codex Luna Reserve usage patch */";
 // Keep these names deliberately descriptive and stable. They are shared by
 // the model-settings hook and the request/default-model paths in app-initial.
 const CORE_SELECTION = "__codexLunaReserveSelectionByHost";
@@ -838,6 +843,69 @@ function migratePatchedCurrent(source) {
   return { status: "patched", code, changes, kind: "current-migration" };
 }
 
+
+function hasUsageCandidate(source) {
+  return (
+    source.includes(USAGE_MARKER) ||
+    (source.includes("additional_rate_limits") &&
+      source.includes("activeLimitName") &&
+      source.includes("selectedModel") &&
+      source.includes("limitName==null"))
+  );
+}
+
+function findUsageFilter(source) {
+  // Upstream builds the remaining-usage list from core + additional_rate_limits,
+  // then keeps only the core row and the additional limit that matches the
+  // selected model (or active limit name). Match the filter shape rather than
+  // the minified helper name so gpt-reserve stays listed while an ordinary
+  // model is selected.
+  const filterRe = new RegExp(
+    `return (${IDENT})\\?(${IDENT})\\.filter\\((${IDENT})=>\\3\\.limitName==null\\|\\|(${IDENT})\\(\\3\\.limitName\\)===\\1\\):\\2\\.filter\\(\\3=>\\3\\.limitName==null\\)`,
+  );
+  const match = filterRe.exec(source);
+  if (!match) return null;
+  const nearby = source.slice(Math.max(0, match.index - 500), match.index + match[0].length + 200);
+  if (!nearby.includes("activeLimitName") || !nearby.includes("selectedModel")) return null;
+  if (!nearby.includes("additional_rate_limits") && !source.includes("additional_rate_limits")) {
+    // The builder that pushes additional_rate_limits lives just above this helper.
+    const ahead = source.slice(Math.max(0, match.index - 1200), match.index);
+    if (!ahead.includes("additional_rate_limits")) return null;
+  }
+  return match;
+}
+
+function patchUsage(source) {
+  if (source.includes(USAGE_MARKER)) {
+    return { status: "already", code: source, changes: [], kind: "usage" };
+  }
+  if (!hasUsageCandidate(source)) return null;
+
+  const filter = findUsageFilter(source);
+  if (!filter) {
+    return { status: "error", code: source, reason: "remaining-usage rate-limit filter not found" };
+  }
+
+  const activeVar = filter[1];
+  const listVar = filter[2];
+  const itemVar = filter[3];
+  const normalizeVar = filter[4];
+  const reserveLiteral = `${BACKTICK}gpt-reserve${BACKTICK}`;
+  const keepReserve = `||${normalizeVar}(${itemVar}.limitName)===${reserveLiteral}`;
+  const replacement =
+    `return ${activeVar}?${listVar}.filter(${itemVar}=>${itemVar}.limitName==null||${normalizeVar}(${itemVar}.limitName)===${activeVar}${keepReserve}):${listVar}.filter(${itemVar}=>${itemVar}.limitName==null${keepReserve})`;
+
+  const code = replaceMatch(source, filter, replacement);
+  return {
+    status: "patched",
+    code: `${USAGE_MARKER}\n${code}`,
+    changes: [
+      "keep the gpt-reserve remaining-usage row visible while an ordinary model is selected",
+    ],
+    kind: "usage",
+  };
+}
+
 function patchSource(source) {
   if (source.includes(MARKER)) {
     return migratePatchedCurrent(source) ?? { status: "already", code: source, changes: [] };
@@ -904,47 +972,98 @@ function findCoreTargets(platform) {
   return targets;
 }
 
+
+function findUsageTargets(platform) {
+  const platforms = platform ? [platform] : PLATFORMS;
+  const targets = [];
+  for (const plat of platforms) {
+    const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
+    if (!fs.existsSync(assetsDir)) continue;
+    for (const file of fs.readdirSync(assetsDir)) {
+      if (!file.endsWith(".js")) continue;
+      const filePath = path.join(assetsDir, file);
+      const source = fs.readFileSync(filePath, "utf8");
+      if (hasUsageCandidate(source)) {
+        targets.push({ kind: "usage", platform: plat, path: filePath, source });
+      }
+    }
+  }
+  return targets;
+}
+
+function applyPatchKind(kind, source) {
+  if (kind === "core") return patchCore(source);
+  if (kind === "usage") return patchUsage(source);
+  return patchSource(source);
+}
+
+function hasCandidateKind(kind, source) {
+  if (kind === "picker") return hasReservePickerCandidate(source);
+  if (kind === "usage") return hasUsageCandidate(source);
+  return hasCoreCandidate(source);
+}
+
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
   const platform = args.find((arg) => PLATFORMS.includes(arg));
-  const targets = [...findTargets(platform), ...findCoreTargets(platform)];
+  const targets = [...findTargets(platform), ...findCoreTargets(platform), ...findUsageTargets(platform)];
 
   if (targets.length === 0) {
     console.log("  [skip] No Luna Reserve bundle found");
     return;
   }
 
+  // One Electron asset can match picker, core, and usage at once. Targets were
+  // pre-loaded from disk, so writing each kind separately let the later write
+  // replace the earlier patch with a stale copy (usage wiped the saved-model
+  // core fix and Reserve got selected again). Chain kinds per file, then write once.
+  const byPath = new Map();
+  for (const target of targets) {
+    const group = byPath.get(target.path) ?? [];
+    group.push(target);
+    byPath.set(target.path, group);
+  }
+
   let patched = 0;
   let failed = 0;
-  for (const target of targets) {
-    const result = target.kind === "core" ? patchCore(target.source) : patchSource(target.source);
-    if (result.status === "none") {
-      if (
-        target.kind === "picker"
-          ? hasReservePickerCandidate(target.source)
-          : hasCoreCandidate(target.source)
-      ) {
-        console.error(`  [x] ${relPath(target.path)} contains Reserve picker logic but no supported patch shape`);
-        failed++;
+  for (const [filePath, group] of byPath) {
+    let source = fs.readFileSync(filePath, "utf8");
+    let fileChanged = false;
+    const platformLabel = group[0].platform;
+
+    console.log(`  [${platformLabel}] ${relPath(filePath)}`);
+
+    for (const target of group) {
+      const result = applyPatchKind(target.kind, source);
+      if (result.status === "none") {
+        if (hasCandidateKind(target.kind, source)) {
+          console.error(
+            `    [x] contains Reserve ${target.kind} logic but no supported patch shape`,
+          );
+          failed++;
+        }
+        continue;
       }
-      continue;
+      if (result.status === "already") {
+        console.log(`    [ok] Luna Reserve ${target.kind} patch already applied`);
+        source = result.code;
+        continue;
+      }
+      if (result.status === "error") {
+        console.error(`    [x] ${result.reason}`);
+        failed++;
+        continue;
+      }
+
+      for (const change of result.changes) console.log(`    * ${change}`);
+      source = result.code;
+      fileChanged = true;
     }
 
-    console.log(`  [${target.platform}] ${relPath(target.path)}`);
-    if (result.status === "already") {
-      console.log(`    [ok] Luna Reserve ${target.kind} patch already applied`);
-      continue;
-    }
-    if (result.status === "error") {
-      console.error(`    [x] ${result.reason}`);
-      failed++;
-      continue;
-    }
-
-    for (const change of result.changes) console.log(`    * ${change}`);
+    if (!fileChanged) continue;
     if (!isCheck) {
-      fs.writeFileSync(target.path, result.code, "utf8");
+      fs.writeFileSync(filePath, source, "utf8");
       patched++;
     } else {
       console.log("    [?] dry-run; no file written");
@@ -960,9 +1079,12 @@ if (require.main === module) main();
 module.exports = {
   MARKER,
   CORE_MARKER,
+  USAGE_MARKER,
   patchSource,
   patchCurrent,
   patchLegacy,
   patchCore,
+  patchUsage,
   hasCoreCandidate,
+  hasUsageCandidate,
 };
