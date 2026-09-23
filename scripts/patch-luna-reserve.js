@@ -607,8 +607,8 @@ function patchCore(source) {
   const reserveConst = reserveConstMatch[1];
 
   // The original-model atom already exists for lifecycle restoration. Keep
-  // separate per-host atoms so availability can drive the fallback without
-  // erasing a model the user explicitly selected.
+  // separate per-host atoms so an explicit Reserve choice can be told apart
+  // from availability. Availability itself must not replace the saved model.
   if (!new RegExp(`\\bvar\\s+${CORE_SELECTION}\\b`).test(code)) {
     code = `var ${CORE_SELECTION},${CORE_MANUAL_SELECTION};\n${code}`;
   } else if (!new RegExp(`\\bvar\\s+${CORE_MANUAL_SELECTION}\\b`).test(code)) {
@@ -667,21 +667,22 @@ function patchCore(source) {
   }
   const activeVar = activeDecl[1];
   const dataVar = activeDecl[2];
-  const hookVar = hookDecl[1];
   const conversationVar = conversationDecl[1];
   const storeVar = storeDecl[1];
   const fallbackVar = fallbackDecl[1];
   const reserveAtom = reserveAtomDecl[1];
+  // Conversation key used by the selection atoms below. Declare it here because
+  // the availability-driven model override is removed: restored/new sessions must
+  // keep the saved or default model. In-memory manual flags do not survive a
+  // restart, so any conditional override keyed only on isLunaReserveActive would
+  // select Reserve again on every launch.
   const selectionKey = `${CORE_SELECTION}Key`;
-  const selectionSet = `${CORE_SELECTION}Set`;
-  const manualSelectionSet = `${CORE_MANUAL_SELECTION}Set`;
-  const selectionActive = `${CORE_SELECTION}Selected`;
-  const manualSelectionActive = `${CORE_MANUAL_SELECTION}Selected`;
-  const stateReplacement =
-    `let ${selectionSet}=${hookVar}(${CORE_SELECTION},${dataVar}.hostId),${manualSelectionSet}=${hookVar}(${CORE_MANUAL_SELECTION},${dataVar}.hostId),${selectionKey}=${conversationVar}??${BACKTICK}__default__${BACKTICK},${selectionActive}=${activeVar}&&${selectionSet}.has(${selectionKey}),${manualSelectionActive}=${activeVar}&&${manualSelectionSet}.has(${selectionKey});` +
-    `if(${activeVar}&&(!${manualSelectionActive}||${selectionActive}))_=({..._,model:${reserveConst}});`;
-  code = replaceMatch(code, force, stateReplacement);
-  changes.push("keep automatic Reserve fallback visible without locking manual model choices");
+  code = replaceMatch(
+    code,
+    force,
+    `let ${selectionKey}=${conversationVar}??${BACKTICK}__default__${BACKTICK};`,
+  );
+  changes.push("keep the saved model for restored and new sessions while Reserve is available");
 
   // Selecting either the synthetic Reserve row or a normal model updates the
   // atom immediately; the underlying lifecycle code can still restore the
@@ -748,12 +749,16 @@ function patchCore(source) {
   let defaultModelCount = 0;
   code = code.replace(defaultModelRe, (_match, emptyThreadModelLookup, conversationModelLookup) => {
     defaultModelCount++;
-    return `(r===${BACKTICK}tpp${BACKTICK}||r===${BACKTICK}flora${BACKTICK})&&n(${reserveAtom},${BACKTICK}local${BACKTICK})&&(!n(${CORE_MANUAL_SELECTION},${BACKTICK}local${BACKTICK}).has(e??${BACKTICK}__default__${BACKTICK})||n(${CORE_SELECTION},${BACKTICK}local${BACKTICK}).has(e??${BACKTICK}__default__${BACKTICK}))?${reserveConst}:e==null?n(${emptyThreadModelLookup},r).slug:n(${conversationModelLookup},e).slug`;
+    // Same resolution as when Reserve limit-fallback has not been triggered:
+    // empty composer → workspace default; restored thread → saved conversation model.
+    return `e==null?n(${emptyThreadModelLookup},r).slug:n(${conversationModelLookup},e).slug`;
   });
   if (defaultModelCount === 0) {
     return { status: "error", code: source, reason: "Reserve default-model override not found" };
   }
-  changes.push(`limit ${defaultModelCount} default-model Reserve override(s) to the active fallback state`);
+  changes.push(
+    `resolve ${defaultModelCount} restored-session and new-session model lookup(s) without forcing Reserve`,
+  );
 
   const submitRe = new RegExp(
     `model:(${IDENT})===${escapeRegExp(BACKTICK)}tpp${escapeRegExp(BACKTICK)}&&(${IDENT})\\.get\\(${escapeRegExp(reserveAtom)},${escapeRegExp(
@@ -769,18 +774,11 @@ function patchCore(source) {
     }
     changes.push("use the lifecycle-selected model in the refactored submission path");
   } else {
-    const submitFunctionStart = code.lastIndexOf("function ", submit.index);
-    const submitSignature = code.slice(submitFunctionStart, submit.index);
-    const submitConversationVar = new RegExp(`conversationId:(${IDENT})`).exec(submitSignature)?.[1];
-    if (!submitConversationVar) {
-      return { status: "error", code: source, reason: "Reserve submit conversation id not found" };
-    }
-    code = replaceMatch(
-      code,
-      submit,
-      `model:${submit[1]}===${BACKTICK}tpp${BACKTICK}&&${submit[2]}.get(${reserveAtom},${BACKTICK}local${BACKTICK})&&(!${submit[2]}.get(${CORE_MANUAL_SELECTION},${BACKTICK}local${BACKTICK}).has(${submitConversationVar}??${BACKTICK}__default__${BACKTICK})||${submit[2]}.get(${CORE_SELECTION},${BACKTICK}local${BACKTICK}).has(${submitConversationVar}??${BACKTICK}__default__${BACKTICK}))?${BACKTICK}gpt-reserve${BACKTICK}:${submit[3]}.slug`,
-    );
-    changes.push("send automatic or explicitly selected Reserve, but honor manual normal selections");
+    // Do not force gpt-reserve merely because Reserve is available. Send whatever
+    // model the session already resolved (saved, default, explicit Reserve, or
+    // lifecycle fallback).
+    code = replaceMatch(code, submit, `model:${submit[3]}.slug`);
+    changes.push("send the saved model instead of forcing Reserve when a session starts");
   }
 
   return {
