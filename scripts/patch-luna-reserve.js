@@ -315,9 +315,12 @@ function patchCurrent(source) {
   }
   const footerFunctionStart = code.lastIndexOf("function ", menuFooter.index);
   const footerFunctionPrefix = code.slice(footerFunctionStart, menuFooter.index);
-  const advancedView = new RegExp(`[;,](${IDENT})=a===${escapeRegExp(BACKTICK)}advanced${escapeRegExp(BACKTICK)}`).exec(
-    footerFunctionPrefix,
-  );
+  const menuView = new RegExp(`(?:^|[,{])menuView:(${IDENT})(?=[,}])`).exec(footerFunctionPrefix);
+  const advancedView = menuView
+    ? new RegExp(
+        `[;,](${IDENT})=${escapeRegExp(menuView[1])}===${escapeRegExp(BACKTICK)}advanced${escapeRegExp(BACKTICK)}`,
+      ).exec(footerFunctionPrefix)
+    : null;
   if (!advancedView) {
     return { detected: true, ok: false, reason: "model picker advanced-view state not found" };
   }
@@ -334,30 +337,29 @@ function patchCurrent(source) {
   // enters the model list. Upstream disables that control whenever the upsell
   // footer exists, which is exactly the Reserve-available state.
   const effortToggleRe = new RegExp(
-    `let (${IDENT})=(${IDENT})\\|\\|(${IDENT})!=null,(${IDENT})=`,
+    `(let\\s+|[;,])(${IDENT})=(${IDENT})\\|\\|(${IDENT})!=null(?=[,;])`,
     "g",
   );
   const effortToggles = [];
   let effortToggle;
   while ((effortToggle = effortToggleRe.exec(code))) {
-    const nearby = code.slice(effortToggle.index, effortToggle.index + 2500);
-    if (!nearby.includes(`modelSelectionDisabled:${effortToggle[1]}`) || !nearby.includes("menuFooter:")) {
+    const nearby = code.slice(effortToggle.index, effortToggle.index + 5000);
+    if (!nearby.includes(`modelSelectionDisabled:${effortToggle[2]}`) ||
+        !nearby.includes(`menuFooter:${effortToggle[4]}`)) {
       continue;
     }
     effortToggles.push(effortToggle);
   }
-  if (effortToggles.length !== 1) {
+  if (effortToggles.length === 0) {
     return {
       detected: true,
       ok: false,
       reason: "model picker effort-toggle disable hook not found",
     };
   }
-  code = replaceMatch(
-    code,
-    effortToggles[0],
-    `let ${effortToggles[0][1]}=${effortToggles[0][2]},${effortToggles[0][4]}=`,
-  );
+  for (const toggle of effortToggles.reverse()) {
+    code = replaceMatch(code, toggle, `${toggle[1]}${toggle[2]}=${toggle[3]}`);
+  }
   changes.push("keep the effort control able to open the model list while Reserve is available");
 
   // Older menu builds disable the same control inline when the footer is present.
@@ -372,15 +374,17 @@ function patchCurrent(source) {
     if (!nearby.includes(`menuFooter:${legacyToggle[2]}`)) continue;
     legacyToggles.push(legacyToggle);
   }
-  if (legacyToggles.length !== 1) {
+  if (effortToggles.length + legacyToggles.length !== 2) {
     return { detected: true, ok: false, reason: "legacy model-list toggle hook not found" };
   }
-  code = replaceMatch(
-    code,
-    legacyToggles[0],
-    `modelSelectionDisabled:${legacyToggles[0][1]}`,
-  );
-  changes.push("keep the legacy model-list toggle enabled while the Reserve footer is visible");
+  if (legacyToggles.length === 1) {
+    code = replaceMatch(
+      code,
+      legacyToggles[0],
+      `modelSelectionDisabled:${legacyToggles[0][1]}`,
+    );
+    changes.push("keep the legacy model-list toggle enabled while the Reserve footer is visible");
+  }
 
   const moonRe = new RegExp(
     `\\(0,${IDENT}\\.jsx\\)\\(${escapeRegExp(BACKTICK)}span${escapeRegExp(
@@ -603,14 +607,6 @@ function patchCore(source) {
 
   let code = source;
   const changes = [];
-  const reserveConstMatch = new RegExp(
-    `(${IDENT})=${escapeRegExp(BACKTICK)}gpt-reserve${escapeRegExp(BACKTICK)}`,
-  ).exec(code);
-  if (!reserveConstMatch) {
-    return { status: "error", code: source, reason: "Reserve model constant not found" };
-  }
-  const reserveConst = reserveConstMatch[1];
-
   // The original-model atom already exists for lifecycle restoration. Keep
   // separate per-host atoms so an explicit Reserve choice can be told apart
   // from availability. Availability itself must not replace the saved model.
@@ -631,14 +627,13 @@ function patchCore(source) {
   changes.push("track Reserve and manual model selection separately from availability");
 
   const forceRe = new RegExp(
-    `if\\((${IDENT})\\)\\{let (${IDENT});n\\[\\d+\\]===_\\?\\2=n\\[\\d+\\]:\\(\\2=\\{\\.\\.\\._,model:${escapeRegExp(
-      reserveConst,
-    )}\\},n\\[\\d+\\]=_,n\\[\\d+\\]=\\2\\),_=\\2\\}`,
+    `if\\((${IDENT})\\)\\{let (${IDENT});n\\[\\d+\\]===(${IDENT})\\?\\2=n\\[\\d+\\]:\\(\\2=\\{\\.\\.\\.\\3,model:(${SELECTOR_EXPR})\\},n\\[\\d+\\]=\\3,n\\[\\d+\\]=\\2\\),\\3=\\2\\}`,
     "g",
   );
   let force;
   while ((force = forceRe.exec(code))) {
-    const nearby = code.slice(Math.max(0, force.index - 2600), force.index);
+    const functionStart = code.lastIndexOf("function ", force.index);
+    const nearby = code.slice(functionStart, force.index + 1600);
     if (nearby.includes("waitForModelFallback") && nearby.includes("originalAdvancedModelSettings")) {
       break;
     }
@@ -646,6 +641,7 @@ function patchCore(source) {
   if (!force) {
     return { status: "error", code: source, reason: "Reserve model state override not found" };
   }
+  const reserveConst = force[4];
 
   const functionStart = code.lastIndexOf("function ", force.index);
   const functionPrefix = code.slice(functionStart, force.index);
@@ -774,7 +770,17 @@ function patchCore(source) {
   );
   const submit = submitRe.exec(code);
   if (!submit) {
-    if (!code.includes("async function dFr") || !code.includes("model:h,resumeAttemptCount")) {
+    // Newer builds pass the resolved model through a request object and then
+    // record it for retries. Neither path has the old inline Reserve override.
+    const requestModelRe = new RegExp(
+      `model:${IDENT},requestedDefaultModel:${IDENT},onClientThreadIdChange:`,
+    );
+    const recordedModelRe = new RegExp(
+      `model:${IDENT},requestProductExperience:[^}]{0,200},resumeAttemptCount:0,serverConversationId:`,
+    );
+    const oldRefactoredPath = code.includes("async function dFr") &&
+      code.includes("model:h,resumeAttemptCount");
+    if (!oldRefactoredPath && !(requestModelRe.test(code) && recordedModelRe.test(code))) {
       return { status: "error", code: source, reason: "Reserve submit override not found" };
     }
     changes.push("use the lifecycle-selected model in the refactored submission path");
