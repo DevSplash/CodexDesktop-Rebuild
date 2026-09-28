@@ -130,7 +130,7 @@ module.exports = {
         "electron.icns", "Assets.car",
         "app.asar",
       ]);
-      const MACOS_ONLY_DIRS = new Set(["native", "app.asar.unpacked"]);
+      const MACOS_ONLY_DIRS = new Set(["native", "app.asar.unpacked", "codex-cli"]);
       const LINUX_RELEASE_FILES = new Set([
         "codex",
         "codex-code-mode-host",
@@ -195,10 +195,25 @@ module.exports = {
       }
 
       if (isLinux) {
+        // The desktop CLI moved into a nested macOS app bundle in newer
+        // releases. Read that binary to select the matching Linux release;
+        // older desktop bundles still keep it at the resource root.
+        const bundledCodexCandidates = [
+          path.join(platformDir, "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex"),
+          path.join(platformDir, "codex"),
+        ];
+        const bundledCodexPath = bundledCodexCandidates.find((candidate) =>
+          fs.existsSync(candidate) && fs.statSync(candidate).isFile(),
+        );
+        if (!bundledCodexPath) {
+          throw new Error(
+            `Bundled desktop Codex binary is missing; checked ${bundledCodexCandidates.join(", ")}`,
+          );
+        }
         installCodexReleaseResources(
           `linux-${arch}`,
           resourcesPath,
-          path.join(platformDir, "codex"),
+          bundledCodexPath,
         );
         const requiredLinuxResources = [
           "codex",
