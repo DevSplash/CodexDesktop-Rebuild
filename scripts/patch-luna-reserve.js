@@ -256,11 +256,11 @@ function patchCurrent(source) {
     },
     {
       re: new RegExp(
-        `!${escapeRegExp(reserveActiveVar)}&&!(${IDENT})&&(${IDENT})&&(${IDENT})\\.availableOptions\\.length>1`,
-      "g",
+        `!${escapeRegExp(reserveActiveVar)}&&!(${IDENT})&&(${IDENT})(!=null)?&&(${IDENT})\\.availableOptions\\.length>1`,
+        "g",
       ),
-      replacement: (_match, left, middle, right) =>
-        `!(${modeExpr})&&!${left}&&${middle}&&${right}.availableOptions.length>1`,
+      replacement: (_match, left, middle, nullCheck, right) =>
+        `!(${modeExpr})&&!${left}&&${middle}${nullCheck ?? ""}&&${right}.availableOptions.length>1`,
       label: "restore service-tier choices for non-reserve selections",
     },
     {
@@ -435,30 +435,43 @@ function patchCurrent(source) {
     }
   }
 
-  // The picker callback receives the display model, while Nt translates the
-  // reserve row to the hidden wire model. Keep that translation for explicit
-  // model changes as well as the state update path.
+  // The picker callback receives the selected model. Older bundles call
+  // selectModelAndReasoningEffort and then record `{model:e}` from a
+  // two-argument function that returns immediately. 26.1002+ passes a third
+  // argument and records the model in a closure before that call. Both must
+  // record the same value the call submits.
   const mapperName = translate[1];
   const mapperStart = code.indexOf(`function ${mapperName}(`, gate.index);
-  const callbackWindowStart = Math.max(0, gate.index - 400);
-  const callbackWindowEnd = mapperStart > callbackWindowStart ? mapperStart : gate.index + 3000;
+  const callbackWindowStart = Math.max(0, gate.index - 800);
+  const callbackWindowEnd = mapperStart > callbackWindowStart ? mapperStart : gate.index + 4000;
   const callbackWindow = code.slice(callbackWindowStart, callbackWindowEnd);
-  const callbackCallOffset = callbackWindow.indexOf("selectModelAndReasoningEffort");
-  const callbackArgs = new RegExp(`(?:${IDENT}=)?function\\((${IDENT}),${IDENT}\\)\\{return`).exec(
-    callbackWindow,
+  const callbackCallOffset = callbackWindow.lastIndexOf("selectModelAndReasoningEffort");
+  const beforeCall = callbackCallOffset >= 0 ? callbackWindow.slice(0, callbackCallOffset) : "";
+  const callbackFnRe = new RegExp(
+    `(?:${IDENT}=)?function\\((${IDENT})(?:,${IDENT}){1,3}\\)\\{|(?:${IDENT}=)?\\((${IDENT})(?:,${IDENT}){1,3}\\)=>\\{`,
+    "g",
   );
-  const callbackArg = callbackArgs?.[1];
-  const modelObjectRe = callbackArg
-    ? new RegExp(`\\{model:${escapeRegExp(callbackArg)}\\}`)
-    : null;
-  const modelObject = modelObjectRe
-    ? modelObjectRe.exec(callbackWindow.slice(callbackCallOffset))
-    : null;
+  let callbackFn;
+  let callbackFnMatch;
+  while ((callbackFn = callbackFnRe.exec(beforeCall))) callbackFnMatch = callbackFn;
+  const callbackArg = callbackFnMatch?.[1] ?? callbackFnMatch?.[2];
+  let modelObject = null;
+  if (callbackArg && callbackFnMatch && callbackCallOffset >= 0) {
+    const aroundStart = callbackFnMatch.index;
+    const aroundEnd = Math.min(callbackWindow.length, callbackCallOffset + 450);
+    const around = callbackWindow.slice(aroundStart, aroundEnd);
+    const modelObjectRe = new RegExp(`\\{model:${escapeRegExp(callbackArg)}\\}`, "g");
+    let candidate;
+    while ((candidate = modelObjectRe.exec(around))) modelObject = candidate;
+    if (modelObject) modelObject.index += aroundStart;
+  }
   if (callbackCallOffset < 0 || !callbackArg || !modelObject) {
     return { detected: true, ok: false, reason: "reserve model callback mapping not found" };
   }
-  const modelObjectStart = callbackWindowStart + callbackCallOffset + modelObject.index;
-  const modelObjectAbsolute = { index: modelObjectStart, 0: modelObject[0] };
+  const modelObjectAbsolute = {
+    index: callbackWindowStart + modelObject.index,
+    0: modelObject[0],
+  };
   code = replaceMatch(code, modelObjectAbsolute, `{model:${mapperName}(${callbackArg})}`);
   changes.push("map an explicitly selected reserve row to the hidden selector");
 
