@@ -22,6 +22,7 @@ const PATCHES = [
   "patch-updater.js",
   "patch-archive-delete.js",
   "patch-luna-reserve.js",
+  "patch-provider-quota.js",
 ];
 
 function main() {
