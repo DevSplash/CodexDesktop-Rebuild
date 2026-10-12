@@ -40,11 +40,13 @@ the bundled desktop binary. Linux packages include
 `resources/codex-release.json` with the source asset and digest.
 
 The custom-provider quota patch prevents the native OpenAI account's exhausted
-5-hour or weekly allowance from disabling submission to a custom model provider,
-including providers with `requires_openai_auth = true`. It uses the saved thread's
-provider first and the resolved host/workspace config for new threads; native
-OpenAI quota checks and other send-button restrictions remain in place. The patch
-runs on Windows and macOS sources, which also supply the Linux frontend.
+5-hour or weekly allowance from disabling submission to a custom model provider
+with an explicit non-ChatGPT `base_url`, including providers with
+`requires_openai_auth = true`. It uses the saved thread's provider first and the
+resolved host/workspace config for new threads. Missing, invalid or ChatGPT base
+URLs and pending configuration retain native quota checks; other send-button
+restrictions remain in place. The patch runs on Windows and macOS sources, which
+also supply the Linux frontend.
 
 ## Development
 

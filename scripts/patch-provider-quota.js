@@ -2,7 +2,7 @@
 /**
  * Scope the desktop composer's OpenAI quota gates to the effective provider.
  * requires_openai_auth selects credentials, not the provider receiving requests.
- * Keep the account quota state intact; only custom-provider submission ignores it.
+ * Keep account quota state intact; only explicit custom endpoints ignore it.
  */
 const fs = require("fs");
 const path = require("path");
@@ -13,6 +13,7 @@ const MARKER = "/* Codex custom provider quota patch */";
 const CUSTOM = "__codexUsesCustomProvider";
 const PROVIDER = "__codexQuotaProvider";
 const THREAD_PROVIDER = "__codexQuotaThreadProvider";
+const PROVIDER_CONFIG = "__codexQuotaProviderConfig";
 const PLATFORMS = ["mac-arm64", "mac-x64", "win", "unix"];
 
 function walk(node, visit, root = node, ownScope = false) {
@@ -140,15 +141,33 @@ function unique(items, label) {
   return items[0];
 }
 
-function patchSource(source, metadata, initialImport) {
-  if (source.includes(MARKER)) return { status: "already", code: source };
+// This function is embedded into the frontend and must remain self-contained.
+// A custom provider ID does not imply a custom endpoint: without base_url,
+// ChatGPT authentication still defaults to chatgpt.com/backend-api/codex.
+function hasExternalBaseUrl(provider) {
+  if (typeof provider?.base_url !== "string" || !provider.base_url.trim()) return false;
   try {
+    const endpoint = new URL(provider.base_url);
+    if (endpoint.protocol !== "https:" && endpoint.protocol !== "http:") return false;
+    const host = endpoint.hostname.toLowerCase().replace(/\.$/, "");
+    if (!host) return false;
+    return !["chatgpt.com", "chat.openai.com"].some(domain =>
+      host === domain || host.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
+function patchSource(source, metadata, initialImport) {
+  try {
+    const updating = source.includes(MARKER);
     const ast = parseModule(source);
     const hardBlockAtom = importedLocal(ast, initialImport, metadata.hardBlockExport);
     const threadProviderAtom = importedLocal(ast, metadata.threadProviderImport.source,
       metadata.threadProviderImport.name);
     if (!hardBlockAtom || !threadProviderAtom) throw new Error("Composer quota/provider imports not found");
-    if ([CUSTOM, PROVIDER, THREAD_PROVIDER].some(name => source.includes(name))) {
+    if (!updating && [CUSTOM, PROVIDER, THREAD_PROVIDER, PROVIDER_CONFIG]
+      .some(name => source.includes(name))) {
       throw new Error("Custom-provider patch binding already exists without its marker");
     }
     const nativeQuotaAtoms = quotaAtoms(ast, source);
@@ -210,22 +229,53 @@ function patchSource(source, metadata, initialImport) {
     if (config.end > statement.start) throw new Error("Composer config is resolved after submission gating");
     const guard = `${MARKER}\nconst ${THREAD_PROVIDER}=${source.slice(hardBlock.init.callee.start, hardBlock.init.callee.end)}(${threadProviderAtom},${conversation.name}),` +
       `${PROVIDER}=${THREAD_PROVIDER}??(${config.id.name}.isConfigDataPending?null:${config.id.name}.resolvedConfig?.model_provider),` +
+      `${PROVIDER_CONFIG}=${config.id.name}.isConfigDataPending?null:${config.id.name}.resolvedConfig?.model_providers?.[${PROVIDER}],` +
       `${CUSTOM}=(${scope}.value.kind===\`local\`||${scope}.value.kind===\`new\`&&!${scope}.value.cloudThreadPrototype)` +
-      `&&typeof ${PROVIDER}===\`string\`&&${PROVIDER}.trim().length>0&&${PROVIDER}!==\`openai\`;`;
-    const edits = [{ start: statement.start, end: statement.start, text: guard }];
+      `&&typeof ${PROVIDER}===\`string\`&&${PROVIDER}.trim().length>0&&${PROVIDER}!==\`openai\`` +
+      `&&(${hasExternalBaseUrl.toString()})(${PROVIDER_CONFIG});`;
+    const edits = [];
+    if (updating) {
+      // Upgrade the previous provider-ID-only guard as well as fresh sources.
+      // Keep the existing hook and quota-gate reads in their original positions.
+      const oldGuard = unique(composer.body.body.filter(node => node.type === "VariableDeclaration" &&
+        node.declarations.some(decl => decl.id.name === CUSTOM)), "Existing provider guard");
+      const oldNames = oldGuard.declarations.map(decl => decl.id.name).join(",");
+      if (oldGuard.kind !== "const" || ![
+        [THREAD_PROVIDER, PROVIDER, CUSTOM].join(","),
+        [THREAD_PROVIDER, PROVIDER, PROVIDER_CONFIG, CUSTOM].join(","),
+      ].includes(oldNames) || oldGuard.end > statement.start ||
+        source.slice(oldGuard.end, statement.start).trim()) {
+        throw new Error("Existing provider guard structure changed");
+      }
+      const markerStart = source.lastIndexOf(MARKER, oldGuard.start);
+      if (markerStart < 0 || source.slice(markerStart + MARKER.length, oldGuard.start).trim()) {
+        throw new Error("Existing provider guard marker is misplaced");
+      }
+      edits.push({ start: markerStart, end: oldGuard.end, text: guard });
+    } else {
+      edits.push({ start: statement.start, end: statement.start, text: guard });
+    }
     for (const gate of [hardBlock, baseBlock]) {
       const read = unique(nodes(disabled.init, node => node.type === "Identifier" &&
         node.name === gate.id.name), `Submit read of ${gate.id.name}`);
-      edits.push({ start: read.start, end: read.end, text: `(!${CUSTOM}&&${gate.id.name})` });
+      if (updating) {
+        unique(nodes(disabled.init, node => node.type === "LogicalExpression" &&
+          node.operator === "&&" && node.left.type === "UnaryExpression" &&
+          node.left.operator === "!" && node.left.argument.name === CUSTOM &&
+          node.right === read), `Existing guard for ${gate.id.name}`);
+      } else {
+        edits.push({ start: read.start, end: read.end, text: `(!${CUSTOM}&&${gate.id.name})` });
+      }
     }
     let code = source;
     for (const edit of edits.sort((a, b) => b.start - a.start)) {
       code = code.slice(0, edit.start) + edit.text + code.slice(edit.end);
     }
     parseModule(code);
+    if (code === source) return { status: "already", code: source };
     return { status: "patched", code, changes: [
       "resolve the effective provider from the saved thread, then the current host/workspace config",
-      "scope both OpenAI send-blocking quota gates to native-provider requests",
+      "ignore OpenAI submission quota gates only for explicit non-ChatGPT custom endpoints",
     ] };
   } catch (error) {
     return { status: "error", code: source, reason: error.message };
