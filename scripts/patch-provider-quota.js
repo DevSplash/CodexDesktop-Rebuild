@@ -107,7 +107,15 @@ function getQuotaMetadata(source) {
     throw new Error("OpenAI quota atom or effective thread-provider lookup is ambiguous/missing");
   }
   const hardBlockExport = exportFor(ast, hardBlockAtoms[0]);
-  const threadProviderImport = importFor(ast, providerReads[0].left.arguments[0].name);
+  const providerAtom = providerReads[0].left.arguments[0];
+  let threadProviderImport = providerAtom?.type === "Identifier"
+    ? importFor(ast, providerAtom.name) : null;
+  // 26.1013 defines that thread-provider atom in this module and exports it.
+  // Older bundles import it. Both names are the binding the composer already uses.
+  if (!threadProviderImport && providerAtom?.type === "Identifier") {
+    const exported = exportFor(ast, providerAtom.name);
+    if (exported) threadProviderImport = { source: null, name: exported };
+  }
   if (!hardBlockExport || !threadProviderImport) {
     throw new Error("OpenAI quota/thread-provider module bindings not found");
   }
@@ -188,9 +196,16 @@ function patchSource(source, metadata, initialImport) {
     const hardBlock = unique(declarations.filter(node => referenced.has(node.id.name) &&
       node.init?.type === "CallExpression" && node.init.arguments[0]?.name === hardBlockAtom &&
       node.init.arguments.length === 2), "Host quota gate");
-    const baseBlock = unique(declarations.filter(node => referenced.has(node.id.name) && node.init &&
+    const directAccountGate = declarations.filter(node => referenced.has(node.id.name) && node.init &&
       nodes(node.init, child => child.type === "CallExpression" && child.arguments.length === 1 &&
-        nativeQuotaAtoms.has(child.arguments[0].name)).length > 0), "Account quota gate");
+        nativeQuotaAtoms.has(child.arguments[0]?.name)).length > 0);
+    // 26.1013 reads the same account-quota atom through a host check:
+    // X(host === "local" && quotaAtom). Keep the direct call when it exists.
+    const indirectAccountGate = declarations.filter(node => referenced.has(node.id.name) && node.init &&
+      nodes(node.init, child => child.type === "Identifier" &&
+        nativeQuotaAtoms.has(child.name)).length > 0);
+    const baseBlock = unique(directAccountGate.length ? directAccountGate : indirectAccountGate,
+      "Account quota gate");
     const configNames = new Set(memberReads.filter(node => property(node) === "resolvedConfig")
       .map(node => unwrap(node).object.name));
     const pendingNames = new Set(memberReads.filter(node => property(node) === "isConfigDataPending")
@@ -306,6 +321,9 @@ function main() {
       }
       if (!candidates.length) throw new Error(`OpenAI quota metadata not found; ${diagnostics.join("; ")}`);
       const { file: initial, metadata } = unique(candidates, "OpenAI quota metadata bundle");
+      if (!metadata.threadProviderImport.source) {
+        metadata.threadProviderImport.source = `./${initial.name}`;
+      }
       const primary = unique(files.filter(file => file.name !== initial.name &&
         file.source.includes(`./${initial.name}`) && file.source.includes("submitDisabled") &&
         file.source.includes("resolvedConfig") && file.source.includes("isConfigDataPending")),

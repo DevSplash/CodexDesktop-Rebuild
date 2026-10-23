@@ -250,8 +250,12 @@ function patchCurrent(source) {
       label: "scope reserve-only picker behavior to the selected model",
     },
     {
-      re: new RegExp(`!(${IDENT})&&!${escapeRegExp(reserveActiveVar)}&&(${IDENT})!=null&&`, "g"),
-      replacement: (_match, left, right) => `!${left}&&!(${modeExpr})&&${right}!=null&&`,
+      re: new RegExp(
+        `!(${IDENT})&&((?:${IDENT}==null&&)?)!${escapeRegExp(reserveActiveVar)}&&(${IDENT})!=null&&`,
+        "g",
+      ),
+      replacement: (_match, left, priorCheck, right) =>
+        `!${left}&&${priorCheck}!(${modeExpr})&&${right}!=null&&`,
       label: "restore service-tier indication for non-reserve selections",
     },
     {
@@ -274,8 +278,11 @@ function patchCurrent(source) {
       label: "show the selected model label instead of always showing Luna",
     },
     {
-      re: new RegExp(`!(${IDENT})&&${escapeRegExp(reserveActiveVar)}\\?`, "g"),
-      replacement: (_match, left) => `!${left}&&(${modeExpr})?`,
+      re: new RegExp(
+        `!(${IDENT})&&((?:${IDENT}==null&&)?)${escapeRegExp(reserveActiveVar)}\\?`,
+        "g",
+      ),
+      replacement: (_match, left, priorCheck) => `!${left}&&${priorCheck}(${modeExpr})?`,
       label: "show the Luna marker only when Luna is selected",
     },
     {
