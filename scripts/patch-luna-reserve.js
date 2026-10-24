@@ -64,10 +64,10 @@ function hasPickerContext(source) {
 function hasReservePickerCandidate(source) {
   if (source.includes(MARKER) || source.includes("modelsForPicker")) return true;
   if (!source.includes("additionalAvailableModels")) return false;
-  if (currentGateRegex().test(source)) return true;
-  return new RegExp(
-    `(${IDENT})&&\\((${IDENT})=(${IDENT})==null\\?\\[\\]:\\[\\{\\.\\.\\.(${IDENT}),model:(${IDENT})\\}\\]\\)`,
-  ).test(source);
+  // Use the same context-checked lookups as the patchers. A bare shape test
+  // also matched unrelated code such as `Pn=T&&(On||Ge===`home`)` in
+  // composer-content (26.1021), which then failed as "no supported patch shape".
+  return findCurrentGate(source) != null || findLegacyCollapse(source) != null;
 }
 
 function findCurrentGate(source) {
@@ -260,11 +260,12 @@ function patchCurrent(source) {
     },
     {
       re: new RegExp(
-        `!${escapeRegExp(reserveActiveVar)}&&!(${IDENT})&&(${IDENT})(!=null)?&&(${IDENT})\\.availableOptions\\.length>1`,
+        // 26.1021 dropped the middle `!x&&` term: `!pe&&rt!=null&&et.availableOptions.length>1`.
+        `!${escapeRegExp(reserveActiveVar)}&&(?:!(${IDENT})&&)?(${IDENT})(!=null)?&&(${IDENT})\\.availableOptions\\.length>1`,
         "g",
       ),
       replacement: (_match, left, middle, nullCheck, right) =>
-        `!(${modeExpr})&&!${left}&&${middle}${nullCheck ?? ""}&&${right}.availableOptions.length>1`,
+        `!(${modeExpr})&&${left ? `!${left}&&` : ""}${middle}${nullCheck ?? ""}&&${right}.availableOptions.length>1`,
       label: "restore service-tier choices for non-reserve selections",
     },
     {
@@ -749,15 +750,27 @@ function patchCore(source) {
 
   const restoreRe = new RegExp(`let (${IDENT})=a\\(${escapeRegExp(reserveAtom)},t\\);if\\(i&&!\\1\\)\\{`);
   const restore = restoreRe.exec(code);
-  if (!restore) {
-    return { status: "error", code: source, reason: "Reserve lifecycle restore watcher not found" };
+  if (restore) {
+    code = replaceMatch(
+      code,
+      restore,
+      `let ${restore[1]}=a(${reserveAtom},t);if(!${restore[1]}){e.set(${CORE_SELECTION},t,new Set);e.set(${CORE_MANUAL_SELECTION},t,new Set)}if(i&&!${restore[1]}){`,
+    );
+    changes.push("clear Reserve and manual selection state when the fallback window ends");
+  } else {
+    // 26.1021 removed the imperative restore watcher: the model-settings hook
+    // now derives the restored model from originalAdvancedModelSettings when
+    // Reserve is inactive. The selection atoms above are bookkeeping only (no
+    // reader), so there is nothing to clear. Only fail if a watcher-like read
+    // of the Reserve atom still exists in a shape we do not recognize.
+    const watcherLikeRe = new RegExp(
+      `let (${IDENT})=${IDENT}\\(${escapeRegExp(reserveAtom)},t\\);if\\(`,
+    );
+    if (watcherLikeRe.test(code)) {
+      return { status: "error", code: source, reason: "Reserve lifecycle restore watcher not found" };
+    }
+    changes.push("no Reserve lifecycle restore watcher upstream (26.1021+); selection state needs no reset");
   }
-  code = replaceMatch(
-    code,
-    restore,
-    `let ${restore[1]}=a(${reserveAtom},t);if(!${restore[1]}){e.set(${CORE_SELECTION},t,new Set);e.set(${CORE_MANUAL_SELECTION},t,new Set)}if(i&&!${restore[1]}){`,
-  );
-  changes.push("clear Reserve and manual selection state when the fallback window ends");
 
   const defaultModelRe = new RegExp(
     `\\(r===${escapeRegExp(BACKTICK)}tpp${escapeRegExp(BACKTICK)}\\|\\|r===${escapeRegExp(
@@ -774,12 +787,32 @@ function patchCore(source) {
     // empty composer → workspace default; restored thread → saved conversation model.
     return `e==null?n(${emptyThreadModelLookup},r).slug:n(${conversationModelLookup},e).slug`;
   });
-  if (defaultModelCount === 0) {
-    return { status: "error", code: source, reason: "Reserve default-model override not found" };
+  if (defaultModelCount > 0) {
+    changes.push(
+      `resolve ${defaultModelCount} restored-session and new-session model lookup(s) without forcing Reserve`,
+    );
+  } else {
+    // 26.1021+: the inline `?gpt-reserve:` lookup became a model-version atom.
+    // When `tpp` + Reserve is active it swaps the catalog and the selected
+    // model to the Luna Reserve version (`lunaReserveModelVersion`). Disable
+    // that same condition so lookups resolve as if Reserve was not triggered.
+    const versionGateRe = new RegExp(
+      `(${IDENT})=!(${IDENT})&&(${IDENT})===${escapeRegExp(BACKTICK)}tpp${escapeRegExp(
+        BACKTICK,
+      )}&&(${IDENT})\\(${escapeRegExp(reserveAtom)},${escapeRegExp(BACKTICK)}local${escapeRegExp(BACKTICK)}\\)`,
+      "g",
+    );
+    let versionGate;
+    while ((versionGate = versionGateRe.exec(code))) {
+      const nearby = code.slice(versionGate.index, versionGate.index + 1500);
+      if (nearby.includes("lunaReserveModelVersion")) break;
+    }
+    if (!versionGate) {
+      return { status: "error", code: source, reason: "Reserve default-model override not found" };
+    }
+    code = replaceMatch(code, versionGate, `${versionGate[1]}=!1`);
+    changes.push("resolve restored-session and new-session models without switching to the Reserve model version");
   }
-  changes.push(
-    `resolve ${defaultModelCount} restored-session and new-session model lookup(s) without forcing Reserve`,
-  );
 
   const submitRe = new RegExp(
     `model:(${IDENT})===${escapeRegExp(BACKTICK)}tpp${escapeRegExp(BACKTICK)}&&(${IDENT})\\.get\\(${escapeRegExp(reserveAtom)},${escapeRegExp(
@@ -793,7 +826,8 @@ function patchCore(source) {
     // Newer builds pass the resolved model through a request object and then
     // record it for retries. Neither path has the old inline Reserve override.
     const requestModelRe = new RegExp(
-      `model:${IDENT},requestedDefaultModel:${IDENT},onClientThreadIdChange:`,
+      // 26.1021 inserted `persistModelSelection:` between the two fields.
+      `model:${IDENT},(?:persistModelSelection:${IDENT},)?requestedDefaultModel:${IDENT},onClientThreadIdChange:`,
     );
     const recordedModelRe = new RegExp(
       `model:${IDENT},requestProductExperience:[^}]{0,200},resumeAttemptCount:0,serverConversationId:`,

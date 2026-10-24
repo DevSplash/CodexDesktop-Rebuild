@@ -14,6 +14,7 @@ const CUSTOM = "__codexUsesCustomProvider";
 const PROVIDER = "__codexQuotaProvider";
 const THREAD_PROVIDER = "__codexQuotaThreadProvider";
 const PROVIDER_CONFIG = "__codexQuotaProviderConfig";
+const THREAD_PROVIDER_ATOM = "__codexQuotaThreadProviderAtom";
 const PLATFORMS = ["mac-arm64", "mac-x64", "win", "unix"];
 
 function walk(node, visit, root = node, ownScope = false) {
@@ -144,6 +145,13 @@ function quotaAtoms(ast, source) {
   }).map(node => binding(node).name));
 }
 
+// 26.1021 moved the account-quota atom out of the composer bundle; the
+// composer imports it from a sibling chunk. Report such atoms by export name.
+function exportedQuotaAtoms(source) {
+  const ast = parseModule(source);
+  return [...quotaAtoms(ast, source)].map(name => exportFor(ast, name)).filter(Boolean);
+}
+
 function unique(items, label) {
   if (items.length !== 1) throw new Error(`${label} is ambiguous/missing (${items.length})`);
   return items[0];
@@ -171,14 +179,35 @@ function patchSource(source, metadata, initialImport) {
     const updating = source.includes(MARKER);
     const ast = parseModule(source);
     const hardBlockAtom = importedLocal(ast, initialImport, metadata.hardBlockExport);
-    const threadProviderAtom = importedLocal(ast, metadata.threadProviderImport.source,
+    let threadProviderAtom = importedLocal(ast, metadata.threadProviderImport.source,
       metadata.threadProviderImport.name);
+    // 26.1021's composer no longer imports the thread-provider atom, although
+    // the module that exports it is still imported. Add it to that import.
+    let providerImportEdit = null;
+    if (hardBlockAtom && !threadProviderAtom) {
+      const declaration = ast.body.find(node => node.type === "ImportDeclaration" &&
+        node.source.value === metadata.threadProviderImport.source &&
+        node.specifiers.length > 0 && node.specifiers.every(s => s.type === "ImportSpecifier"));
+      if (declaration && !source.includes(THREAD_PROVIDER_ATOM)) {
+        const last = declaration.specifiers[declaration.specifiers.length - 1];
+        threadProviderAtom = THREAD_PROVIDER_ATOM;
+        providerImportEdit = {
+          start: last.end,
+          end: last.end,
+          text: `,${metadata.threadProviderImport.name} as ${THREAD_PROVIDER_ATOM}`,
+        };
+      }
+    }
     if (!hardBlockAtom || !threadProviderAtom) throw new Error("Composer quota/provider imports not found");
     if (!updating && [CUSTOM, PROVIDER, THREAD_PROVIDER, PROVIDER_CONFIG]
       .some(name => source.includes(name))) {
       throw new Error("Custom-provider patch binding already exists without its marker");
     }
     const nativeQuotaAtoms = quotaAtoms(ast, source);
+    for (const { source: from, name } of metadata.quotaImports ?? []) {
+      const local = importedLocal(ast, from, name);
+      if (local) nativeQuotaAtoms.add(local);
+    }
     const composer = unique(ast.body.filter(node => node.type === "FunctionDeclaration" &&
       nodes(node, child => property(child) === "submitDisabled", true).length > 0 &&
       nodes(node, child => property(child) === "resolvedConfig").length > 0),
@@ -248,7 +277,7 @@ function patchSource(source, metadata, initialImport) {
       `${CUSTOM}=(${scope}.value.kind===\`local\`||${scope}.value.kind===\`new\`&&!${scope}.value.cloudThreadPrototype)` +
       `&&typeof ${PROVIDER}===\`string\`&&${PROVIDER}.trim().length>0&&${PROVIDER}!==\`openai\`` +
       `&&(${hasExternalBaseUrl.toString()})(${PROVIDER_CONFIG});`;
-    const edits = [];
+    const edits = providerImportEdit ? [providerImportEdit] : [];
     if (updating) {
       // Upgrade the previous provider-ID-only guard as well as fresh sources.
       // Keep the existing hook and quota-gate reads in their original positions.
@@ -328,6 +357,14 @@ function main() {
         file.source.includes(`./${initial.name}`) && file.source.includes("submitDisabled") &&
         file.source.includes("resolvedConfig") && file.source.includes("isConfigDataPending")),
       "Composer bundle");
+      metadata.quotaImports = [];
+      for (const file of files) {
+        if (file.name === primary.name || !primary.source.includes(`"./${file.name}"`)) continue;
+        if (!["authenticatedAccountId", "windowMinutes", "resetsAt"].every(key => file.source.includes(key))) continue;
+        for (const name of exportedQuotaAtoms(file.source)) {
+          metadata.quotaImports.push({ source: `./${file.name}`, name });
+        }
+      }
       const result = patchSource(primary.source, metadata, `./${initial.name}`);
       if (result.status === "error") throw new Error(result.reason);
       const filePath = path.join(directory.path, primary.name);
