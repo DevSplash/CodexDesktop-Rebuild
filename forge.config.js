@@ -220,9 +220,21 @@ module.exports = {
           "codex-code-mode-host",
           "rg",
           "bwrap",
-          path.join("zsh", "bin", "zsh"),
           "codex-release.json",
         ];
+        // openai/codex stopped shipping codex-resources/zsh in its Linux
+        // packages starting with rust-v0.163.0, and the desktop bundle does
+        // not reference a bundled zsh. Keep it executable when an older
+        // package still provides it, but do not require it.
+        const optionalLinuxResources = [path.join("zsh", "bin", "zsh")];
+        for (const relativePath of optionalLinuxResources) {
+          const resourcePath = path.join(resourcesPath, relativePath);
+          if (fs.existsSync(resourcePath)) {
+            try { fs.chmodSync(resourcePath, 0o755); } catch {}
+          } else {
+            console.log(`   [info] Codex release package has no ${relativePath} (optional)`);
+          }
+        }
         for (const relativePath of requiredLinuxResources) {
           const resourcePath = path.join(resourcesPath, relativePath);
           if (!fs.existsSync(resourcePath)) {
