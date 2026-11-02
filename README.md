@@ -48,6 +48,10 @@ URLs and pending configuration retain native quota checks; other send-button
 restrictions remain in place. The patch runs on Windows and macOS sources, which
 also supply the Linux frontend.
 
+Fast-mode controls follow upstream authentication, model service-tier capabilities,
+and workspace requirements. The obsolete `fast_mode` authentication-comparison
+patch has been removed; API-key login does not inherit ChatGPT Fast-mode access.
+
 ## Development
 
 ```bash

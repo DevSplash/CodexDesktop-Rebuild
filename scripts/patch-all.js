@@ -15,7 +15,6 @@ const PATCHES = [
   "patch-i18n.js",
   "patch-copyright.js",
   "patch-devtools.js",
-  "patch-fast-mode.js",
   "patch-plugin-auth.js",
   "patch-proxy-config.js",
   "patch-windows-portable-core.js",

@@ -1,8 +1,8 @@
 /**
  * Post-build patch: Update copyright text
  *
- * Uses AST to locate `setAboutPanelOptions({ copyright: "(c) OpenAI" })`
- * and replace the copyright string with a custom value.
+ * Uses AST to locate the copyright property or the About dialog's HTML template
+ * and replace the copyright text with a custom value, including split build chunks.
  *
  * Usage:
  *   node scripts/patch-copyright.js [platform]   # Apply patch (unix/win/omit=both)
@@ -46,6 +46,22 @@ function walk(node, visitor) {
 function collectPatches(ast, source) {
   const patches = [];
   walk(ast, (node) => {
+    // Newer bundles render their own About dialog instead of using Electron's
+    // setAboutPanelOptions. Match only its copyright element, not arbitrary
+    // OpenAI references, and accept the compiler's escaped copyright symbol.
+    if (node.type === "TemplateElement") {
+      const raw = source.slice(node.start, node.end);
+      const pattern = /(<div\b[^>]*\bclass=["']copyright["'][^>]*>)(?:\u00a9|\\x[aA]9|\\u00[aA]9) OpenAI(<\/div>)/g;
+      for (const match of raw.matchAll(pattern)) {
+        patches.push({
+          start: node.start + match.index,
+          end: node.start + match.index + match[0].length,
+          replacement: `${match[1]}${NEW_COPYRIGHT}${match[2]}`,
+          original: match[0],
+        });
+      }
+      return;
+    }
     if (node.type !== "Property") return;
     const keyName =
       node.key.type === "Identifier"
@@ -98,18 +114,20 @@ function main() {
 
   const bundles = locateBundles({
     dir: "build",
-    pattern: /^main(-[^.]+)?\.js$/,
+    pattern: /\.js$/,
     platform,
+    allMatches: true,
   });
 
   if (bundles.length === 0) {
-    console.error("[x] No main bundle found");
+    console.error("[x] No main-process build bundles found");
     process.exit(1);
   }
 
   for (const bundle of bundles) {
-    console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
     const source = fs.readFileSync(bundle.path, "utf-8");
+    if (!source.includes("copyright")) continue;
+    console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
     console.log(`   size: ${(source.length / 1024 / 1024).toFixed(1)} MB`);
 
     const t0 = Date.now();
@@ -143,6 +161,7 @@ function main() {
       code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
     }
 
+    parse(code, { ecmaVersion: "latest", sourceType: "module" });
     fs.writeFileSync(bundle.path, code, "utf-8");
     console.log(`   [ok] Copyright updated: ${patches.length} replacements`);
   }

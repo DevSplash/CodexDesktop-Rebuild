@@ -3,7 +3,7 @@
  * Post-build patch: Force-enable DevTools & InspectElement
  *
  * Strategy (AST-based):
- *   In the main bundle, find Property nodes:
+ *   Across main-process build chunks, find Property nodes:
  *   - allowInspectElement: <value>  ->  allowInspectElement: !0
  *   - devTools: <expr containing allowDevtools>  ->  devTools: !0
  *
@@ -87,18 +87,21 @@ function main() {
 
   const bundles = locateBundles({
     dir: "build",
-    pattern: /^main(-[^.]+)?\.js$/,
+    pattern: /\.js$/,
     platform,
+    allMatches: true,
   });
 
   if (bundles.length === 0) {
-    console.error("[x] No main bundle found");
+    console.error("[x] No main-process build bundles found");
     process.exit(1);
   }
 
   for (const bundle of bundles) {
-    console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
     const source = fs.readFileSync(bundle.path, "utf-8");
+    if (!source.includes("allowInspectElement") &&
+      !(source.includes("devTools") && /allowDevtools|allowDevTools/.test(source))) continue;
+    console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
     console.log(`   size: ${(source.length / 1048576).toFixed(1)} MB`);
 
     const t0 = Date.now();
@@ -140,6 +143,7 @@ function main() {
       patched = patched.slice(0, p.start) + p.replacement + patched.slice(p.end);
     }
 
+    parse(patched, { ecmaVersion: "latest", sourceType: "module" });
     fs.writeFileSync(bundle.path, patched, "utf-8");
     console.log(`   [ok] DevTools force-enabled: ${patches.length} replacements`);
   }
