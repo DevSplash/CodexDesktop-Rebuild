@@ -101,6 +101,11 @@ module.exports = {
     },
   ],
   hooks: {
+    preMake: async () => {
+      if (process.platform !== "linux") return;
+      const { prepareRpmSpecTemplate } = require("./scripts/linux-rpm-compat");
+      console.log(`   [rpm] staging path compatibility: ${prepareRpmSpecTemplate()}`);
+    },
     // Copy everything from the platform dir to the app's Resources:
     // - app.asar (repacked by prepare-src with patches applied)
     // - app.asar.unpacked/ (upstream native modules, untouched)

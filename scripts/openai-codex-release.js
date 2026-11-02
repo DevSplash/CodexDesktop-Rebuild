@@ -32,14 +32,27 @@ const releaseCache = new Map();
 const packageCache = new Map();
 
 function curlText(url) {
-  return execFileSync("curl", [
+  const args = [
     "-fsSL",
     "--retry", "3",
     "--retry-delay", "2",
     "-H", "Accept: application/vnd.github+json",
     "-H", "User-Agent: CodexDesktop-Rebuild",
-    url,
-  ], {
+  ];
+  const endpoint = new URL(url);
+  const isGitHubApi = endpoint.protocol === "https:" && endpoint.hostname === "api.github.com";
+  const token = isGitHubApi && (process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim());
+  let input;
+  if (token) {
+    if (/[\r\n]/.test(token)) throw new Error("GitHub token must not contain newlines");
+    // Keep credentials out of process arguments and error messages. Public
+    // release/checksum downloads must not receive this API-only credential.
+    args.push("-H", "@-");
+    input = `Authorization: Bearer ${token}\n`;
+  }
+  args.push(url);
+  return execFileSync("curl", args, {
+    input,
     encoding: "utf-8",
     maxBuffer: 64 * 1024 * 1024,
   });

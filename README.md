@@ -39,6 +39,11 @@ verifies the official SHA-256 manifest, and installs its Linux resource set.
 the bundled desktop binary. Linux packages include
 `resources/codex-release.json` with the source asset and digest.
 
+Linux builds use `GITHUB_TOKEN` (or `GH_TOKEN`) for GitHub Release metadata when
+available; both Actions workflows provide a read-only token to the Linux build
+step. Public asset URLs and SHA-256 verification are unchanged. The RPM maker
+also adjusts its staging copy path for RPM 4.20+ and 6.x working directories.
+
 The custom-provider quota patch prevents the native OpenAI account's exhausted
 5-hour or weekly allowance from disabling submission to a custom model provider
 with an explicit non-ChatGPT `base_url`, including providers with

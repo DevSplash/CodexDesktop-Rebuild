@@ -67,6 +67,8 @@ jobs:
   build-linux:
     if: inputs.platform == 'all' || inputs.platform == 'linux'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -85,6 +87,8 @@ jobs:
       - run: node scripts/sync-upstream.js --force --skip-win
       - run: node scripts/patch-all.js mac-${{ matrix.arch }}
       - run: npm run build:linux-${{ matrix.arch }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/upload-artifact@v7
         with:
           name: Codex-Linux-${{ matrix.arch }}
