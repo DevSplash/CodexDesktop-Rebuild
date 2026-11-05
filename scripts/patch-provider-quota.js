@@ -7,7 +7,7 @@
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("acorn");
-const { SRC_DIR, relPath } = require("./patch-util");
+const { SRC_DIR, relPath, listJavaScriptFiles } = require("./patch-util");
 
 const MARKER = "/* Codex custom provider quota patch */";
 const CUSTOM = "__codexUsesCustomProvider";
@@ -178,9 +178,12 @@ function patchSource(source, metadata, initialImport) {
   try {
     const updating = source.includes(MARKER);
     const ast = parseModule(source);
-    const hardBlockAtom = importedLocal(ast, initialImport, metadata.hardBlockExport);
-    let threadProviderAtom = importedLocal(ast, metadata.threadProviderImport.source,
-      metadata.threadProviderImport.name);
+    const referenceKey = node => node?.type === "Identifier" ? node.name
+      : node?.type === "MemberExpression" ? `${source.slice(node.object.start, node.object.end)}[${JSON.stringify(property(node))}]` : null;
+    const hardBlockAtom = metadata.rspackReferences?.[0] ??
+      importedLocal(ast, initialImport, metadata.hardBlockExport);
+    let threadProviderAtom = metadata.rspackReferences?.[1] ??
+      importedLocal(ast, metadata.threadProviderImport.source, metadata.threadProviderImport.name);
     // 26.1021's composer no longer imports the thread-provider atom, although
     // the module that exports it is still imported. Add it to that import.
     let providerImportEdit = null;
@@ -204,6 +207,7 @@ function patchSource(source, metadata, initialImport) {
       throw new Error("Custom-provider patch binding already exists without its marker");
     }
     const nativeQuotaAtoms = quotaAtoms(ast, source);
+    if (metadata.rspackReferences) nativeQuotaAtoms.add(metadata.rspackReferences[2]);
     for (const { source: from, name } of metadata.quotaImports ?? []) {
       const local = importedLocal(ast, from, name);
       if (local) nativeQuotaAtoms.add(local);
@@ -223,16 +227,15 @@ function patchSource(source, metadata, initialImport) {
       "Submit-disabled expression");
     const referenced = new Set(nodes(disabled.init, node => node.type === "Identifier").map(node => node.name));
     const hardBlock = unique(declarations.filter(node => referenced.has(node.id.name) &&
-      node.init?.type === "CallExpression" && node.init.arguments[0]?.name === hardBlockAtom &&
+      node.init?.type === "CallExpression" && referenceKey(node.init.arguments[0]) === hardBlockAtom &&
       node.init.arguments.length === 2), "Host quota gate");
     const directAccountGate = declarations.filter(node => referenced.has(node.id.name) && node.init &&
       nodes(node.init, child => child.type === "CallExpression" && child.arguments.length === 1 &&
-        nativeQuotaAtoms.has(child.arguments[0]?.name)).length > 0);
+        nativeQuotaAtoms.has(referenceKey(child.arguments[0]))).length > 0);
     // 26.1013 reads the same account-quota atom through a host check:
     // X(host === "local" && quotaAtom). Keep the direct call when it exists.
     const indirectAccountGate = declarations.filter(node => referenced.has(node.id.name) && node.init &&
-      nodes(node.init, child => child.type === "Identifier" &&
-        nativeQuotaAtoms.has(child.name)).length > 0);
+      nodes(node.init, child => nativeQuotaAtoms.has(referenceKey(child))).length > 0);
     const baseBlock = unique(directAccountGate.length ? directAccountGate : indirectAccountGate,
       "Account quota gate");
     const configNames = new Set(memberReads.filter(node => property(node) === "resolvedConfig")
@@ -271,7 +274,7 @@ function patchSource(source, metadata, initialImport) {
     const statement = unique(composer.body.body.filter(node => node.type === "VariableDeclaration" &&
       node.declarations.includes(disabled)), "Submit-disabled declaration");
     if (config.end > statement.start) throw new Error("Composer config is resolved after submission gating");
-    const guard = `${MARKER}\nconst ${THREAD_PROVIDER}=${source.slice(hardBlock.init.callee.start, hardBlock.init.callee.end)}(${threadProviderAtom},${conversation.name}),` +
+    const guard = `${MARKER}\nconst ${THREAD_PROVIDER}=(${source.slice(hardBlock.init.callee.start, hardBlock.init.callee.end)})(${threadProviderAtom},${conversation.name}),` +
       `${PROVIDER}=${THREAD_PROVIDER}??(${config.id.name}.isConfigDataPending?null:${config.id.name}.resolvedConfig?.model_provider),` +
       `${PROVIDER_CONFIG}=${config.id.name}.isConfigDataPending?null:${config.id.name}.resolvedConfig?.model_providers?.[${PROVIDER}],` +
       `${CUSTOM}=(${scope}.value.kind===\`local\`||${scope}.value.kind===\`new\`&&!${scope}.value.cloudThreadPrototype)` +
@@ -339,8 +342,23 @@ function main() {
   let failed = 0;
   for (const directory of directories) {
     try {
-      const files = fs.readdirSync(directory.path).filter(name => name.endsWith(".js"))
-        .map(name => ({ name, source: fs.readFileSync(path.join(directory.path, name), "utf8") }));
+      const files = listJavaScriptFiles(directory.path).map(filePath => ({
+        name: path.relative(directory.path, filePath).split(path.sep).join("/"),
+        source: fs.readFileSync(filePath, "utf8"),
+      }));
+      if (files.some(file => /\bexport\s+(?:const|let|var)\s+__webpack_modules__\s*=/.test(file.source))) {
+        const { patchRspackFiles } = require("./patch-provider-quota-rspack");
+        const result = patchRspackFiles(files, { patchSource, quotaAtoms });
+        for (const change of result.changes) console.log(`    * ${change}`);
+        for (const { file, code } of result.outputs) {
+          const filePath = path.join(directory.path, ...file.name.split("/"));
+          console.log(`  [${directory.platform}] ${relPath(filePath)}`);
+          if (check) console.log("    [?] dry-run; no file written");
+          else { fs.writeFileSync(filePath, code, "utf8"); patched++; }
+        }
+        console.log(`    [ok] ${result.copies} Rspack composer copies ${result.outputs.length ? "matched" : "already patched"}`);
+        continue;
+      }
       const candidates = [];
       const diagnostics = [];
       for (const file of files.filter(file => file.source.includes("hardBlocked") &&

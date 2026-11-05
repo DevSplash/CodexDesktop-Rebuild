@@ -51,7 +51,8 @@ with an explicit non-ChatGPT `base_url`, including providers with
 resolved host/workspace config for new threads. Missing, invalid or ChatGPT base
 URLs and pending configuration retain native quota checks; other send-button
 restrictions remain in place. The patch runs on Windows and macOS sources, which
-also supply the Linux frontend.
+also supply the Linux frontend. It supports both the older Vite layout and the
+Rspack async-module layout, including every emitted copy of the composer module.
 
 Fast-mode controls follow upstream authentication, model service-tier capabilities,
 and workspace requirements. The obsolete `fast_mode` authentication-comparison

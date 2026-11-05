@@ -91,4 +91,15 @@ function relPath(absPath) {
   return path.relative(PROJECT_ROOT, absPath);
 }
 
-module.exports = { locateBundles, relPath, SRC_DIR, PROJECT_ROOT };
+// Rspack places most frontend chunks in assets/async; Vite used a flat directory.
+function listJavaScriptFiles(directory) {
+  const files = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) files.push(...listJavaScriptFiles(entryPath));
+    else if (entry.isFile() && entry.name.endsWith(".js")) files.push(entryPath);
+  }
+  return files;
+}
+
+module.exports = { locateBundles, relPath, listJavaScriptFiles, SRC_DIR, PROJECT_ROOT };
