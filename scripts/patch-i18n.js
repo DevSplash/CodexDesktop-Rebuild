@@ -2,25 +2,26 @@
  * Post-build patch: Force-enable i18n by bypassing Statsig cloud control
  *
  * Codex i18n is gated behind a Statsig layer field "enable_i18n".
- * The Statsig server can push enable_i18n=false to override the default.
+ * The Statsig server can push enable_i18n=false to override the default, and
+ * some chunks default enable_i18n to !1 when offline.
  *
  * AST match: any .get("enable_i18n", <default>) call expression
  * (optionally wrapped in ChainExpression for ?.get), replaced with !0.
  *
- * Target files: any chunk containing "enable_i18n" (index-*.js, general-settings-*.js, app-main-*.js)
+ * Target files: any chunk under webview/assets/ (including Rspack async/)
+ * containing "enable_i18n".
  *
  * Usage:
- *   node scripts/patch-i18n.js [platform]   # Apply (mac-arm64/mac-x64/win/omit=all)
+ *   node scripts/patch-i18n.js [platform]   # Apply (mac-arm64/mac-x64/win/unix/omit=all)
  *   node scripts/patch-i18n.js --check      # Dry-run
  */
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("acorn");
-const { locateBundles, relPath, SRC_DIR } = require("./patch-util");
+const { listJavaScriptFiles, relPath, SRC_DIR } = require("./patch-util");
 
-// ──────────────────────────────────────────────
-//  AST walker
-// ──────────────────────────────────────────────
+const MARKER = "/* Codex i18n patch */";
+const FIELD_NAME = "enable_i18n";
 
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
@@ -36,12 +37,6 @@ function walk(node, visitor) {
     }
   }
 }
-
-// ──────────────────────────────────────────────
-//  AST matching
-// ──────────────────────────────────────────────
-
-const FIELD_NAME = "enable_i18n";
 
 /**
  * Find CallExpression (possibly wrapped in ChainExpression):
@@ -95,8 +90,9 @@ function collectPatches(ast, source) {
     const exprSrc = source.slice(replaceNode.start, replaceNode.end);
     if (exprSrc === "!0") return;
 
-    // Dedup
-    if (seen.has(replaceNode.start)) return;
+    // Dedup (when ChainExpression wraps CallExpression, outer node visits first)
+    if (seen.has(callNode.start)) return;
+    seen.add(callNode.start);
     seen.add(replaceNode.start);
 
     patches.push({
@@ -110,65 +106,51 @@ function collectPatches(ast, source) {
   return patches;
 }
 
-// ──────────────────────────────────────────────
-//  Bundle location: scan all JS chunks for enable_i18n
-// ──────────────────────────────────────────────
+function selectedPlatforms(platform) {
+  const all = ["mac-arm64", "mac-x64", "win"];
+  if (platform === "unix") {
+    return ["mac-arm64", "mac-x64"].filter((p) =>
+      fs.existsSync(path.join(SRC_DIR, p, "_asar", "webview", "assets")),
+    );
+  }
+  if (platform) return [platform];
+  return all.filter((p) => fs.existsSync(path.join(SRC_DIR, p, "_asar", "webview", "assets")));
+}
 
 function locateTargets(platform) {
-  const platforms = platform
-    ? [platform]
-    : ["mac-arm64", "mac-x64", "win"].filter((p) =>
-        fs.existsSync(path.join(SRC_DIR, p, "_asar", "webview", "assets"))
-      );
-
   const targets = [];
-  for (const plat of platforms) {
-    // Check index-*.js
-    const indexBundles = locateBundles({ dir: "assets", pattern: /^index-.*\.js$/, platform: plat });
-    for (const b of indexBundles) {
-      const src = fs.readFileSync(b.path, "utf-8");
-      if (src.includes(FIELD_NAME)) {
-        targets.push(b);
-      }
-    }
-
-    // Check other chunks (general-settings-*.js, app-main-*.js, etc.)
+  for (const plat of selectedPlatforms(platform)) {
     const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
     if (!fs.existsSync(assetsDir)) continue;
-    for (const f of fs.readdirSync(assetsDir)) {
-      if (!f.endsWith(".js") || f.startsWith("index-")) continue;
-      const fp = path.join(assetsDir, f);
+    for (const fp of listJavaScriptFiles(assetsDir)) {
       const src = fs.readFileSync(fp, "utf-8");
-      if (src.includes(FIELD_NAME)) {
-        targets.push({ platform: plat, path: fp });
+      if (src.includes(FIELD_NAME) || src.includes(MARKER)) {
+        targets.push({ platform: plat, path: fp, source: src });
       }
     }
   }
-
   return targets;
 }
-
-// ──────────────────────────────────────────────
-//  Main
-// ──────────────────────────────────────────────
 
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
-  const platform = args.find((a) => ["mac-arm64", "mac-x64", "win"].includes(a));
+  const platform = args.find((a) => ["mac-arm64", "mac-x64", "win", "unix"].includes(a));
 
   const targets = locateTargets(platform);
 
   if (targets.length === 0) {
-    console.log("[ok] No files contain enable_i18n (upstream may have removed gate)");
+    console.log("  [skip] No files contain enable_i18n (upstream removed gate)");
     return;
   }
 
   let grandTotal = 0;
+  let failed = 0;
+  const pendingWrites = [];
 
   for (const bundle of targets) {
     console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
-    const source = fs.readFileSync(bundle.path, "utf-8");
+    const source = bundle.source;
     console.log(`   size: ${(source.length / 1024 / 1024).toFixed(1)} MB`);
 
     const t0 = Date.now();
@@ -179,7 +161,12 @@ function main() {
     grandTotal += patches.length;
 
     if (patches.length === 0) {
-      console.log("   [ok] enable_i18n already bypassed or no AST match");
+      if (source.includes(MARKER)) {
+        console.log("   [ok] enable_i18n already bypassed");
+      } else {
+        console.error("   [x] File references enable_i18n, but no .get(\"enable_i18n\", ...) AST node matched");
+        failed++;
+      }
       continue;
     }
 
@@ -198,14 +185,26 @@ function main() {
       console.log(`   * offset ${p.start}: ${p.original.slice(0, 60)} -> !0`);
       code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
     }
+    if (!code.includes(MARKER)) {
+      code = `${MARKER}\n${code}`;
+    }
 
-    fs.writeFileSync(bundle.path, code, "utf-8");
-    console.log(`   [ok] i18n gate bypassed: ${patches.length} replacements`);
+    parse(code, { ecmaVersion: "latest", sourceType: "module" });
+    pendingWrites.push({ path: bundle.path, code, count: patches.length });
+  }
+
+  if (failed > 0) process.exit(1);
+
+  for (const write of pendingWrites) {
+    fs.writeFileSync(write.path, write.code, "utf-8");
+    console.log(`   [ok] ${relPath(write.path)}: i18n gate bypassed (${write.count} replacement(s))`);
   }
 
   if (isCheck && grandTotal > 0) {
-    console.log(`\n=> Total: ${grandTotal} patchable locations`);
+    console.log(`\n=> Total: ${grandTotal} patchable location(s)`);
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { FIELD_NAME, MARKER, collectPatches };

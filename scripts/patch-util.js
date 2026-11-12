@@ -5,8 +5,10 @@
 const fs = require("fs");
 const path = require("path");
 
-const SRC_DIR = path.join(__dirname, "..", "src");
 const PROJECT_ROOT = path.join(__dirname, "..");
+const SRC_DIR = process.env.CODEX_SRC_DIR
+  ? path.resolve(process.env.CODEX_SRC_DIR)
+  : path.join(PROJECT_ROOT, "src");
 
 /**
  * Locate bundles matching a filename pattern across platform directories.
@@ -16,7 +18,7 @@ const PROJECT_ROOT = path.join(__dirname, "..");
  *   "build"  -> src/{plat}/.vite/build/
  *   "assets" -> src/{plat}/webview/assets/
  * @param {RegExp} opts.pattern - Filename regex (e.g. /^index-.*\.js$/)
- * @param {string} [opts.platform] - Restrict to a single platform
+ * @param {string} [opts.platform] - Restrict to a single platform (or "unix" for mac-arm64 + mac-x64)
  * @param {boolean} [opts.allMatches=false] - Return all matching chunks, not just one per platform
  * @returns {Array<{platform: string, path: string}>}
  */
@@ -36,9 +38,15 @@ function locateBundles({ dir, pattern, platform, allMatches = false }) {
   if (!getDir) throw new Error(`Unknown dir type: ${dir}`);
 
   const ALL_PLATFORMS = ["mac-arm64", "mac-x64", "win"];
-  const platforms = platform
-    ? [platform]
-    : ALL_PLATFORMS.filter((p) => fs.existsSync(getDir(p)));
+  const candidatePlatforms =
+    platform === "unix"
+      ? ["mac-arm64", "mac-x64"]
+      : platform
+        ? [platform]
+        : ALL_PLATFORMS;
+  const platforms = platform && platform !== "unix"
+    ? candidatePlatforms
+    : candidatePlatforms.filter((p) => fs.existsSync(getDir(p)));
 
   // Legacy fallback
   if (platforms.length === 0) {
@@ -47,7 +55,7 @@ function locateBundles({ dir, pattern, platform, allMatches = false }) {
       const files = fs.readdirSync(fallback).filter((f) => pattern.test(f));
       if (files.length > 0) {
         if (allMatches) {
-          return files.map(file => ({ platform: "legacy", path: path.join(fallback, file) }));
+          return files.map((file) => ({ platform: "legacy", path: path.join(fallback, file) }));
         }
         // For build dir, prefer hashed file over plain
         const target =
@@ -70,7 +78,7 @@ function locateBundles({ dir, pattern, platform, allMatches = false }) {
     }
 
     if (allMatches) {
-      results.push(...files.map(file => ({ platform: plat, path: path.join(d, file) })));
+      results.push(...files.map((file) => ({ platform: plat, path: path.join(d, file) })));
       continue;
     }
 
@@ -85,10 +93,17 @@ function locateBundles({ dir, pattern, platform, allMatches = false }) {
 }
 
 /**
- * Return path relative to project root.
+ * Return path relative to project root (or virtual src/ when CODEX_SRC_DIR is set).
  */
 function relPath(absPath) {
-  return path.relative(PROJECT_ROOT, absPath);
+  const resolved = path.resolve(absPath);
+  if (
+    process.env.CODEX_SRC_DIR &&
+    (resolved === SRC_DIR || resolved.startsWith(`${SRC_DIR}${path.sep}`))
+  ) {
+    return path.join("src", path.relative(SRC_DIR, resolved));
+  }
+  return path.relative(PROJECT_ROOT, resolved);
 }
 
 // Rspack places most frontend chunks in assets/async; Vite used a flat directory.

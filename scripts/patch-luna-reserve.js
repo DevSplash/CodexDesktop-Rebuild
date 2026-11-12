@@ -20,7 +20,8 @@
  */
 const fs = require("fs");
 const path = require("path");
-const { relPath, SRC_DIR } = require("./patch-util");
+const { parse } = require("acorn");
+const { relPath, SRC_DIR, listJavaScriptFiles } = require("./patch-util");
 
 const IDENT = "[A-Za-z_$][A-Za-z0-9_$]*";
 const MARKER = "/* Codex Luna Reserve picker patch */";
@@ -30,10 +31,15 @@ const USAGE_MARKER = "/* Codex Luna Reserve usage patch */";
 // the model-settings hook and the request/default-model paths in app-initial.
 const CORE_SELECTION = "__codexLunaReserveSelectionByHost";
 const CORE_MANUAL_SELECTION = "__codexLunaReserveManualSelectionByHost";
-const PLATFORMS = ["mac-arm64", "mac-x64", "win"];
+const PLATFORMS = ["mac-arm64", "mac-x64", "win", "unix"];
 const BACKTICK = String.fromCharCode(96);
+// 26.1103 exports the reserve wire id and reads it back as `G.qz` instead of
+// inlining the `gpt-reserve` literal. Member expressions have to be tried
+// before a bare identifier, or the identifier alternative consumes `G`.
+const MEMBER_EXPR = `${IDENT}(?:\\.${IDENT})+`;
+const ATOM_EXPR = `(?:${MEMBER_EXPR}|${IDENT})`;
 const SELECTOR_EXPR =
-  `(?:${IDENT}|${BACKTICK}[^${BACKTICK}]*${BACKTICK}|"[^"]*"|'[^']*')`;
+  `(?:${MEMBER_EXPR}|${IDENT}|${BACKTICK}[^${BACKTICK}]*${BACKTICK}|"[^"]*"|'[^']*')`;
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\[\]\\]/g, "\\$&");
@@ -70,12 +76,21 @@ function hasReservePickerCandidate(source) {
   return findCurrentGate(source) != null || findLegacyCollapse(source) != null;
 }
 
+function nearbyHasPicker(source, selector) {
+  if (source.includes("modelsForPicker")) return true;
+  // A member selector such as `G.qz` is only the reserve gate when the picker
+  // catalog is here. `additionalAvailableModels` alone also sits next to
+  // unrelated `a===b.c` expressions.
+  if (String(selector).includes(".")) return false;
+  return source.includes("additionalAvailableModels");
+}
+
 function findCurrentGate(source) {
   const gateRe = currentGateRegex();
   let gate;
   while ((gate = gateRe.exec(source))) {
     const nearby = source.slice(gate.index, gate.index + 60000);
-    if (hasPickerContext(nearby)) return gate;
+    if (nearbyHasPicker(nearby, gate[5])) return gate;
   }
   return null;
 }
@@ -127,7 +142,7 @@ function patchCurrent(source) {
   changes.push("stop forcing reserve mode when Reserve is merely available");
 
   const reserveIdsRe = new RegExp(
-    `(${IDENT})=${escapeRegExp(forceVar)}\\?\\[(${IDENT}),(${IDENT})\\]:\\[\\]`,
+    `(${IDENT})=${escapeRegExp(forceVar)}\\?\\[(${ATOM_EXPR}),(${ATOM_EXPR})\\]:\\[\\]`,
     "g",
   );
   const reserveIds = reserveIdsRe.exec(code.slice(gate.index));
@@ -156,7 +171,7 @@ function patchCurrent(source) {
   const collapseRe = new RegExp(
     `(${IDENT})=${escapeRegExp(restrictedVar)}\\?(${IDENT})\\?\\.filter\\((${IDENT})\\):\\2;${escapeRegExp(
       reserveActiveVar,
-    )}&&\\(\\1=(${IDENT})==null\\?\\[\\]:\\[\\4\\]\\)`,
+    )}&&\\(\\1=(?:null==)?(${IDENT})(?:==null)?\\?\\[\\]:\\[\\4\\]\\)`,
     "g",
   );
   const collapse = collapseRe.exec(code.slice(gate.index));
@@ -229,7 +244,7 @@ function patchCurrent(source) {
   const translateRe = new RegExp(
     `function\\s+(${IDENT})\\(e\\)\\{return\\s*${escapeRegExp(
       reserveActiveVar,
-    )}\\s*&&\\s*e===(${IDENT})\\?(${IDENT}):e\\}`,
+    )}\\s*&&\\s*e===(${ATOM_EXPR})\\?(${ATOM_EXPR}):e\\}`,
     "g",
   );
   const translate = execAfter(code, translateRe, gate.index);
@@ -251,26 +266,35 @@ function patchCurrent(source) {
     },
     {
       re: new RegExp(
-        `!(${IDENT})&&((?:${IDENT}==null&&)?)!${escapeRegExp(reserveActiveVar)}&&(${IDENT})!=null&&`,
+        `!(${IDENT})&&((?:${IDENT}==null&&)?)!${escapeRegExp(reserveActiveVar)}&&(${IDENT})!=null&&|!${escapeRegExp(reserveActiveVar)}&&null!=(${IDENT})&&(?!${IDENT}\\.availableOptions)`,
         "g",
       ),
-      replacement: (_match, left, priorCheck, right) =>
-        `!${left}&&${priorCheck}!(${modeExpr})&&${right}!=null&&`,
+      replacement: (_match, left, priorCheck, right, nullId) =>
+        nullId
+          ? `!(${modeExpr})&&null!=${nullId}&&`
+          : `!${left}&&${priorCheck}!(${modeExpr})&&${right}!=null&&`,
       label: "restore service-tier indication for non-reserve selections",
     },
     {
       re: new RegExp(
-        // 26.1021 dropped the middle `!x&&` term: `!pe&&rt!=null&&et.availableOptions.length>1`.
-        `!${escapeRegExp(reserveActiveVar)}&&(?:!(${IDENT})&&)?(${IDENT})(!=null)?&&(${IDENT})\\.availableOptions\\.length>1`,
+        // 26.1021 dropped the middle `!x&&` term. 26.1103 writes the null
+        // check as `null!=oa` instead of `oa!=null`.
+        `!${escapeRegExp(reserveActiveVar)}&&(?:!(${IDENT})&&)?(null!=)?(${IDENT})(!=null)?&&(${IDENT})\\.availableOptions\\.length>1`,
         "g",
       ),
-      replacement: (_match, left, middle, nullCheck, right) =>
-        `!(${modeExpr})&&${left ? `!${left}&&` : ""}${middle}${nullCheck ?? ""}&&${right}.availableOptions.length>1`,
+      replacement: (_match, left, nullPrefix, middle, nullCheck, right) =>
+        `!(${modeExpr})&&${left ? `!${left}&&` : ""}${nullPrefix ?? ""}${middle}${nullCheck ?? ""}&&${right}.availableOptions.length>1`,
       label: "restore service-tier choices for non-reserve selections",
     },
     {
-      re: new RegExp(`openLabel:([^,]+)&&!${escapeRegExp(reserveActiveVar)}\\?`, "g"),
-      replacement: (_match, prefix) => `openLabel:${prefix}&&!(${modeExpr})?`,
+      re: new RegExp(
+        `openLabel:([^?]{0,180}?)(?:&&!${escapeRegExp(reserveActiveVar)}\\?|\\|\\|${escapeRegExp(reserveActiveVar)}\\?)`,
+        "g",
+      ),
+      replacement: (match, prefix) =>
+        match.includes(`||${reserveActiveVar}?`)
+          ? `openLabel:${prefix}||(${modeExpr})?`
+          : `openLabel:${prefix}&&!(${modeExpr})?`,
       label: "restore the normal effort label for non-reserve selections",
     },
     {
@@ -280,7 +304,9 @@ function patchCurrent(source) {
     },
     {
       re: new RegExp(
-        `!(${IDENT})&&((?:${IDENT}==null&&)?)${escapeRegExp(reserveActiveVar)}\\?`,
+        // 26.1013 writes the extra guard as `ident==null&&`. 26.1103 writes
+        // the closed-trigger moon as `!n7&&null==oo&&reserve?`.
+        `!(${IDENT})&&((?:(?:${IDENT}==null|null==${IDENT})&&)?)(${escapeRegExp(reserveActiveVar)})\\?`,
         "g",
       ),
       replacement: (_match, left, priorCheck) => `!${left}&&${priorCheck}(${modeExpr})?`,
@@ -297,6 +323,13 @@ function patchCurrent(source) {
   for (const { re, replacement, label } of modeReplacements) {
     const match = execAfter(code, re, gate.index);
     if (!match) {
+      // 26.1103 draws the moon inside selectedLabel, which the previous
+      // replacement already limits to the selected Reserve model.
+      if (label === "show the Luna marker only when Luna is selected" &&
+          code.includes(`selectedLabel:(${modeExpr})?`) && code.includes("🌙")) {
+        changes.push("keep the Reserve icon on the selected Reserve label");
+        continue;
+      }
       return { detected: true, ok: false, reason: `mode-specific expression not found: ${label}` };
     }
     code = replaceMatch(
@@ -318,34 +351,58 @@ function patchCurrent(source) {
     )}div${escapeRegExp(BACKTICK)},\\{className:(${IDENT})\\.MenuFooter,children:\\3\\}\\),t\\[\\2\\]=\\3,t\\[\\4\\]=\\1\\)`,
   );
   const menuFooter = menuFooterRe.exec(code);
-  if (!menuFooter) {
-    return { detected: true, ok: false, reason: "model picker footer layout hook not found" };
+  if (menuFooter) {
+    const footerFunctionStart = code.lastIndexOf("function ", menuFooter.index);
+    const footerFunctionPrefix = code.slice(footerFunctionStart, menuFooter.index);
+    const menuView = new RegExp(`(?:^|[,{])menuView:(${IDENT})(?=[,}])`).exec(footerFunctionPrefix);
+    const advancedView = menuView
+      ? new RegExp(
+          `[;,](${IDENT})=${escapeRegExp(menuView[1])}===${escapeRegExp(BACKTICK)}advanced${escapeRegExp(BACKTICK)}`,
+        ).exec(footerFunctionPrefix)
+      : null;
+    if (!advancedView) {
+      return { detected: true, ok: false, reason: "model picker advanced-view state not found" };
+    }
+    const [, footerResult, footerSlot, footerValue, footerCacheSlot, footerRuntime, footerStyle] = menuFooter;
+    const advancedVar = advancedView[1];
+    code = replaceMatch(
+      code,
+      menuFooter,
+      `let ${footerResult};t[${footerSlot}]?.[0]===${footerValue}&&t[${footerSlot}]?.[1]===${advancedVar}?${footerResult}=t[${footerCacheSlot}]:(${footerResult}=${footerValue}==null||${advancedVar}?null:(0,${footerRuntime}.jsx)(${BACKTICK}div${BACKTICK},{className:${footerStyle}.MenuFooter,children:${footerValue}}),t[${footerSlot}]=[${footerValue},${advancedVar}],t[${footerCacheSlot}]=${footerResult})`,
+    );
+    changes.push("hide the Reserve upsell footer while the normal model list is open");
+  } else {
+    // 26.1103 renders the upsell as a component while Reserve is active and
+    // caches it without the menu view. Hide it on the advanced (model list)
+    // view and store that view in the existing cache slot.
+    const componentFooterRe = new RegExp(
+      `(${IDENT})\\[(\\d+)\\]!==${escapeRegExp(reserveActiveVar)}\\|\\|\\1\\[(\\d+)\\]!==(${IDENT})\\?\\((${IDENT})=${escapeRegExp(reserveActiveVar)}\\?\\(0,(${IDENT})\\.jsx\\)\\((${ATOM_EXPR}),\\{hostId:\\4\\}\\):void 0,\\1\\[\\2\\]=${escapeRegExp(reserveActiveVar)},\\1\\[\\3\\]=\\4,\\1\\[(\\d+)\\]=\\5\\):\\5=\\1\\[\\8\\]`,
+    );
+    const componentFooter = componentFooterRe.exec(code);
+    if (!componentFooter) {
+      return { detected: true, ok: false, reason: "model picker footer layout hook not found" };
+    }
+    const view = new RegExp(`menuFooter:${componentFooter[5]},menuView:(${IDENT})`).exec(
+      code.slice(componentFooter.index, componentFooter.index + 8000),
+    );
+    if (!view) {
+      return { detected: true, ok: false, reason: "model picker advanced-view state not found" };
+    }
+    const [, cache, activeSlot, hostSlot, host, result, runtime, component, valueSlot] = componentFooter;
+    const viewVar = view[1];
+    code = replaceMatch(
+      code,
+      componentFooter,
+      `${cache}[${activeSlot}]!==${reserveActiveVar}||${cache}[${hostSlot}]!==${host}||${cache}[${valueSlot}]?.[1]!==${viewVar}?(${result}=${reserveActiveVar}&&${viewVar}!==${BACKTICK}advanced${BACKTICK}?(0,${runtime}.jsx)(${component},{hostId:${host}}):void 0,${cache}[${activeSlot}]=${reserveActiveVar},${cache}[${hostSlot}]=${host},${cache}[${valueSlot}]=[${result},${viewVar}]):${result}=${cache}[${valueSlot}][0]`,
+    );
+    changes.push("hide the Reserve upsell footer while the normal model list is open");
   }
-  const footerFunctionStart = code.lastIndexOf("function ", menuFooter.index);
-  const footerFunctionPrefix = code.slice(footerFunctionStart, menuFooter.index);
-  const menuView = new RegExp(`(?:^|[,{])menuView:(${IDENT})(?=[,}])`).exec(footerFunctionPrefix);
-  const advancedView = menuView
-    ? new RegExp(
-        `[;,](${IDENT})=${escapeRegExp(menuView[1])}===${escapeRegExp(BACKTICK)}advanced${escapeRegExp(BACKTICK)}`,
-      ).exec(footerFunctionPrefix)
-    : null;
-  if (!advancedView) {
-    return { detected: true, ok: false, reason: "model picker advanced-view state not found" };
-  }
-  const [, footerResult, footerSlot, footerValue, footerCacheSlot, footerRuntime, footerStyle] = menuFooter;
-  const advancedVar = advancedView[1];
-  code = replaceMatch(
-    code,
-    menuFooter,
-    `let ${footerResult};t[${footerSlot}]?.[0]===${footerValue}&&t[${footerSlot}]?.[1]===${advancedVar}?${footerResult}=t[${footerCacheSlot}]:(${footerResult}=${footerValue}==null||${advancedVar}?null:(0,${footerRuntime}.jsx)(${BACKTICK}div${BACKTICK},{className:${footerStyle}.MenuFooter,children:${footerValue}}),t[${footerSlot}]=[${footerValue},${advancedVar}],t[${footerCacheSlot}]=${footerResult})`,
-  );
-  changes.push("hide the Reserve upsell footer while the normal model list is open");
 
   // Opening the menu stays on the compact slider. The effort control is what
   // enters the model list. Upstream disables that control whenever the upsell
   // footer exists, which is exactly the Reserve-available state.
   const effortToggleRe = new RegExp(
-    `(let\\s+|[;,])(${IDENT})=(${IDENT})\\|\\|(${IDENT})!=null(?=[,;])`,
+    `(let\\s+|[;,])(${IDENT})=(${IDENT})\\|\\|(?:null!=)?(${IDENT})(?:!=null)?(?=[,;])`,
     "g",
   );
   const effortToggles = [];
@@ -382,8 +439,12 @@ function patchCurrent(source) {
     if (!nearby.includes(`menuFooter:${legacyToggle[2]}`)) continue;
     legacyToggles.push(legacyToggle);
   }
-  if (effortToggles.length + legacyToggles.length !== 2) {
+  const sawNullPrefix = effortToggles.some((toggle) => toggle[0].includes("||null!="));
+  if (!sawNullPrefix && effortToggles.length + legacyToggles.length !== 2) {
     return { detected: true, ok: false, reason: "legacy model-list toggle hook not found" };
+  }
+  if (sawNullPrefix && effortToggles.length === 0) {
+    return { detected: true, ok: false, reason: "model picker effort-toggle disable hook not found" };
   }
   if (legacyToggles.length === 1) {
     code = replaceMatch(
@@ -401,18 +462,21 @@ function patchCurrent(source) {
   );
   const moon = execAfter(code, moonRe, gate.index);
   const optionLabelRe = new RegExp(
-    `label:\\(0,(${IDENT})\\.jsx\\)\\((${IDENT}),\\{model:(${IDENT})\\.model,displayName:\\3\\.displayName,stripGptPrefix:!0\\}\\)`,
+    `label:\\(0,(${IDENT})\\.jsx\\)\\((${ATOM_EXPR}),\\{model:(${IDENT})\\.model,displayName:\\3\\.displayName,stripGptPrefix:!0\\}\\)`,
     "g",
   );
   const optionLabels = [];
   let optionLabelMatch;
   while ((optionLabelMatch = optionLabelRe.exec(code))) optionLabels.push(optionLabelMatch);
-  if (!moon || optionLabels.length !== 1) {
+  if (optionLabels.length !== 1 || (!moon && !code.includes("🌙"))) {
     return { detected: true, ok: false, reason: "reserve model option label hook not found" };
   }
   const optionLabel = optionLabels[0];
   const [, labelRuntime, labelComponent, labelModel] = optionLabel;
-  const reserveLabel = `label:${labelModel}.model===${reserveSelector}?(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{className:${BACKTICK}flex min-w-0 items-center gap-1${BACKTICK},children:[(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{\"aria-hidden\":${BACKTICK}true${BACKTICK},children:${moon[1]}}),(0,${labelRuntime}.jsx)(${labelComponent},{model:${labelModel}.model,displayName:${labelModel}.displayName,stripGptPrefix:!0})]}):(0,${labelRuntime}.jsx)(${labelComponent},{model:${labelModel}.model,displayName:${labelModel}.displayName,stripGptPrefix:!0})`;
+  const moonChild = moon
+    ? `(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{\"aria-hidden\":${BACKTICK}true${BACKTICK},children:${moon[1]}})`
+    : `(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{\"aria-hidden\":${BACKTICK}true${BACKTICK},children:${BACKTICK}🌙${BACKTICK}})`;
+  const reserveLabel = `label:${labelModel}.model===${reserveSelector}?(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{className:${BACKTICK}flex min-w-0 items-center gap-1${BACKTICK},children:[${moonChild},(0,${labelRuntime}.jsx)(${labelComponent},{model:${labelModel}.model,displayName:${labelModel}.displayName,stripGptPrefix:!0})]}):(0,${labelRuntime}.jsx)(${labelComponent},{model:${labelModel}.model,displayName:${labelModel}.displayName,stripGptPrefix:!0})`;
   code = replaceMatch(code, optionLabel, reserveLabel);
   changes.push("mark the Reserve list row with the Reserve icon");
 
@@ -424,7 +488,7 @@ function patchCurrent(source) {
     if (needleIndex < 0) continue;
     const start = Math.max(gate.index, needleIndex - 1200);
     const segment = code.slice(start, needleIndex);
-    const dependencyRe = new RegExp(`t\\[\\d+\\]!==${escapeRegExp(reserveActiveVar)}`, "g");
+    const dependencyRe = new RegExp(`(${IDENT})\\[(\\d+)\\]!==${escapeRegExp(reserveActiveVar)}`, "g");
     let dependency;
     let candidate;
     while ((candidate = dependencyRe.exec(segment))) dependency = candidate;
@@ -435,11 +499,11 @@ function patchCurrent(source) {
     const dependencyIndex = dependency[0].match(/\[(\d+)\]/)?.[1];
     if (dependencyIndex == null) continue;
     const assignmentRe = new RegExp(
-      `t\\[${dependencyIndex}\\]=${escapeRegExp(reserveActiveVar)}`,
+      `${escapeRegExp(dependency[1])}\\[${dependencyIndex}\\]=${escapeRegExp(reserveActiveVar)}`,
     );
     const assignment = execAfter(code, assignmentRe, absolute.index);
     if (assignment) {
-      code = replaceMatch(code, assignment, `t[${dependencyIndex}]=${forceVar}`);
+      code = replaceMatch(code, assignment, `${dependency[1]}[${dependencyIndex}]=${forceVar}`);
     }
   }
 
@@ -609,15 +673,56 @@ function findCoreAtom(source) {
   return null;
 }
 
+function hasCoreMarkers(source) {
+  return source.includes("waitForModelFallback") &&
+    source.includes("isLunaReserveActive") &&
+    source.includes("originalAdvancedModelSettings") &&
+    source.includes("setModelAndReasoningEffortForNextTurn");
+}
+
 function hasCoreCandidate(source) {
-  return (
-    source.includes(CORE_MARKER) ||
-    (source.includes("waitForModelFallback") &&
-      source.includes("isLunaReserveActive") &&
-      source.includes("originalAdvancedModelSettings") &&
-      source.includes("setModelAndReasoningEffortForNextTurn") &&
-      source.includes("gpt-reserve"))
+  if (source.includes(CORE_MARKER)) return true;
+  if (!hasCoreMarkers(source)) return false;
+  // Older bundles spell the wire id inline. 26.1103 reads the exported
+  // constant (`_.qz`) inside the same override.
+  return source.includes("gpt-reserve") ||
+    new RegExp(`if\\(${IDENT}\\)\\{let ${IDENT};${IDENT}\\[\\d+\\]!==${IDENT}\\?\\(${IDENT}=\\{\\.\\.\\.${IDENT},model:`).test(source);
+}
+
+function patchCompactCore(source) {
+  // The model-settings hook no longer lives beside the atom table. It still
+  // overwrites the saved model with the reserve constant whenever Reserve is
+  // active, and it rewrites an explicit Reserve choice back to the fallback.
+  const forceRe = new RegExp(
+    `if\\((${IDENT})\\)\\{let (${IDENT});(${IDENT})\\[(\\d+)\\]!==(${IDENT})\\?\\(\\2=\\{\\.\\.\\.\\5,model:(${SELECTOR_EXPR})\\},\\3\\[\\4\\]=\\5,\\3\\[(\\d+)\\]=\\2\\):\\2=\\3\\[\\7\\],\\5=\\2\\}`,
+    "g",
   );
+  const forces = [];
+  let force;
+  while ((force = forceRe.exec(source))) forces.push(force);
+  if (forces.length !== 1) return null;
+  const activeVar = forces[0][1];
+  const reserveSelector = forces[0][6];
+  let code = source.slice(0, forces[0].index) + source.slice(forces[0].index + forces[0][0].length);
+  const remapRe = new RegExp(
+    `${escapeRegExp(activeVar)}&&(${IDENT})===${escapeRegExp(reserveSelector)}\\?(${IDENT}):\\1`,
+    "g",
+  );
+  let remapped = 0;
+  code = code.replace(remapRe, (_match, selected) => {
+    remapped++;
+    return selected;
+  });
+  if (remapped < 1) return null;
+  return {
+    status: "patched",
+    code: `${CORE_MARKER}\n${code}`,
+    changes: [
+      "keep the saved model while Reserve is available",
+      "keep an explicit Reserve choice on the gpt-reserve wire model",
+    ],
+    kind: "core",
+  };
 }
 
 function patchCore(source) {
@@ -625,6 +730,11 @@ function patchCore(source) {
     return { status: "already", code: source, changes: [], kind: "core" };
   }
   if (!hasCoreCandidate(source)) return null;
+  if (!source.includes("gpt-reserve")) {
+    const compact = patchCompactCore(source);
+    if (compact) return compact;
+    return { status: "error", code: source, reason: "Reserve lifecycle atom family not found" };
+  }
 
   let code = source;
   const changes = [];
@@ -910,7 +1020,7 @@ function hasUsageCandidate(source) {
     (source.includes("additional_rate_limits") &&
       source.includes("activeLimitName") &&
       source.includes("selectedModel") &&
-      source.includes("limitName==null"))
+      (source.includes("limitName==null") || /null==[A-Za-z_$][\w$]*\.limitName/.test(source)))
   );
 }
 
@@ -935,15 +1045,49 @@ function findUsageFilter(source) {
   return match;
 }
 
+function findNormalizedUsageFilter(source) {
+  // 26.1103 normalizes the limit name before comparing, and writes the empty
+  // check as `null==item.limitName`.
+  const filterRe = new RegExp(
+    `return (${IDENT})\\?(${IDENT})\\.filter\\((${IDENT})=>null==\\3\\.limitName\\|\\|(${IDENT})\\(\\3\\.limitName\\)===\\1\\):\\2\\.filter\\(\\3=>null==\\3\\.limitName\\)`,
+  );
+  const match = filterRe.exec(source);
+  if (!match) return null;
+  const nearby = source.slice(Math.max(0, match.index - 400), match.index + match[0].length + 200);
+  if (!nearby.includes("activeLimitName") || !nearby.includes("selectedModel")) return null;
+  if (!source.includes("additional_rate_limits")) return null;
+  match.normalized = true;
+  return match;
+}
+
 function patchUsage(source) {
   if (source.includes(USAGE_MARKER)) {
     return { status: "already", code: source, changes: [], kind: "usage" };
   }
   if (!hasUsageCandidate(source)) return null;
 
-  const filter = findUsageFilter(source);
+  const filter = findUsageFilter(source) || findNormalizedUsageFilter(source);
   if (!filter) {
     return { status: "error", code: source, reason: "remaining-usage rate-limit filter not found" };
+  }
+  if (filter.normalized) {
+    const activeVar = filter[1];
+    const listVar = filter[2];
+    const itemVar = filter[3];
+    const normalizeVar = filter[4];
+    const reserveLiteral = `${BACKTICK}gpt-reserve${BACKTICK}`;
+    const keepReserve = `||${normalizeVar}(${itemVar}.limitName)===${reserveLiteral}`;
+    const replacement =
+      `return ${activeVar}?${listVar}.filter(${itemVar}=>null==${itemVar}.limitName||${normalizeVar}(${itemVar}.limitName)===${activeVar}${keepReserve}):${listVar}.filter(${itemVar}=>null==${itemVar}.limitName${keepReserve})`;
+    const code = replaceMatch(source, filter, replacement);
+    return {
+      status: "patched",
+      code: `${USAGE_MARKER}\n${code}`,
+      changes: [
+        "keep the gpt-reserve remaining-usage row visible while an ordinary model is selected",
+      ],
+      kind: "usage",
+    };
   }
 
   const activeVar = filter[1];
@@ -996,59 +1140,47 @@ function patchSource(source) {
   return { status: "none", code: source, changes: [] };
 }
 
-function findTargets(platform) {
-  const platforms = platform ? [platform] : PLATFORMS;
-  const targets = [];
-  for (const plat of platforms) {
-    const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
-    if (!fs.existsSync(assetsDir)) continue;
-    for (const file of fs.readdirSync(assetsDir)) {
-      if (!file.endsWith(".js")) continue;
-      const filePath = path.join(assetsDir, file);
-      const source = fs.readFileSync(filePath, "utf8");
-      if (hasReservePickerCandidate(source)) {
-        targets.push({ kind: "picker", platform: plat, path: filePath, source });
-      }
-    }
-  }
-  return targets;
+function resolvePlatforms(platform) {
+  if (platform === "unix") return ["mac-arm64", "mac-x64"];
+  if (platform) return [platform];
+  return ["mac-arm64", "mac-x64", "win"];
 }
 
-function findCoreTargets(platform) {
-  const platforms = platform ? [platform] : PLATFORMS;
-  const targets = [];
+function assetSources(platform) {
+  const platforms = resolvePlatforms(platform);
+  const files = [];
   for (const plat of platforms) {
     const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
     if (!fs.existsSync(assetsDir)) continue;
-    for (const file of fs.readdirSync(assetsDir)) {
-      if (!file.endsWith(".js")) continue;
-      const filePath = path.join(assetsDir, file);
-      const source = fs.readFileSync(filePath, "utf8");
-      if (hasCoreCandidate(source)) {
-        targets.push({ kind: "core", platform: plat, path: filePath, source });
-      }
+    // Rspack emits the picker, the model-settings hook, and the quota rows
+    // under assets/async. A top-level readdir no longer sees them.
+    for (const filePath of listJavaScriptFiles(assetsDir)) {
+      files.push({
+        platform: plat,
+        path: filePath,
+        source: fs.readFileSync(filePath, "utf8"),
+      });
     }
   }
-  return targets;
+  return files;
 }
 
+function findTargets(platform, preloadedFiles = null) {
+  return (preloadedFiles ?? assetSources(platform))
+    .filter((file) => hasReservePickerCandidate(file.source))
+    .map((file) => ({ kind: "picker", platform: file.platform, path: file.path, source: file.source }));
+}
 
-function findUsageTargets(platform) {
-  const platforms = platform ? [platform] : PLATFORMS;
-  const targets = [];
-  for (const plat of platforms) {
-    const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
-    if (!fs.existsSync(assetsDir)) continue;
-    for (const file of fs.readdirSync(assetsDir)) {
-      if (!file.endsWith(".js")) continue;
-      const filePath = path.join(assetsDir, file);
-      const source = fs.readFileSync(filePath, "utf8");
-      if (hasUsageCandidate(source)) {
-        targets.push({ kind: "usage", platform: plat, path: filePath, source });
-      }
-    }
-  }
-  return targets;
+function findCoreTargets(platform, preloadedFiles = null) {
+  return (preloadedFiles ?? assetSources(platform))
+    .filter((file) => hasCoreCandidate(file.source))
+    .map((file) => ({ kind: "core", platform: file.platform, path: file.path, source: file.source }));
+}
+
+function findUsageTargets(platform, preloadedFiles = null) {
+  return (preloadedFiles ?? assetSources(platform))
+    .filter((file) => hasUsageCandidate(file.source))
+    .map((file) => ({ kind: "usage", platform: file.platform, path: file.path, source: file.source }));
 }
 
 function applyPatchKind(kind, source) {
@@ -1067,17 +1199,43 @@ function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
   const platform = args.find((arg) => PLATFORMS.includes(arg));
-  const targets = [...findTargets(platform), ...findCoreTargets(platform), ...findUsageTargets(platform)];
+  const files = assetSources(platform);
 
-  if (targets.length === 0) {
+  if (files.length === 0) {
+    if (platform) {
+      console.error(`  [x] No webview/assets JS files found for ${platform}`);
+      process.exit(1);
+    }
     console.log("  [skip] No Luna Reserve bundle found");
     return;
   }
 
-  // One Electron asset can match picker, core, and usage at once. Targets were
-  // pre-loaded from disk, so writing each kind separately let the later write
-  // replace the earlier patch with a stale copy (usage wiped the saved-model
-  // core fix and Reserve got selected again). Chain kinds per file, then write once.
+  const pickerTargets = findTargets(platform, files);
+  const coreTargets = findCoreTargets(platform, files);
+  const usageTargets = findUsageTargets(platform, files);
+  const targets = [...pickerTargets, ...coreTargets, ...usageTargets];
+
+  let failed = 0;
+  const activePlatforms = [...new Set(files.map((f) => f.platform))];
+  for (const plat of activePlatforms) {
+    const pCount = pickerTargets.filter((t) => t.platform === plat).length;
+    const cCount = coreTargets.filter((t) => t.platform === plat).length;
+    const uCount = usageTargets.filter((t) => t.platform === plat).length;
+    if (pCount === 0 || cCount === 0 || uCount === 0) {
+      console.error(
+        `  [x] [${plat}] Incomplete Luna Reserve targets (picker=${pCount}, core=${cCount}, usage=${uCount})`,
+      );
+      failed++;
+    }
+  }
+
+  if (targets.length === 0) {
+    console.error(`  [x] No Luna Reserve candidate bundles found across ${files.length} asset files`);
+    process.exit(1);
+  }
+
+  // One Electron asset can match picker, core, and usage at once. Chain kinds
+  // per file, validate syntax, and write atomically only when all files succeed.
   const byPath = new Map();
   for (const target of targets) {
     const group = byPath.get(target.path) ?? [];
@@ -1085,10 +1243,9 @@ function main() {
     byPath.set(target.path, group);
   }
 
-  let patched = 0;
-  let failed = 0;
+  const pendingWrites = [];
   for (const [filePath, group] of byPath) {
-    let source = fs.readFileSync(filePath, "utf8");
+    let source = group[0].source;
     let fileChanged = false;
     const platformLabel = group[0].platform;
 
@@ -1122,16 +1279,29 @@ function main() {
     }
 
     if (!fileChanged) continue;
-    if (!isCheck) {
-      fs.writeFileSync(filePath, source, "utf8");
-      patched++;
+    try {
+      parse(source, { ecmaVersion: "latest", sourceType: "module" });
+    } catch (err) {
+      console.error(`    [x] patched output failed JS syntax check: ${err.message}`);
+      failed++;
+      continue;
+    }
+
+    if (isCheck) {
+      console.log("    [?] dry-run; syntax verified, no file written");
     } else {
-      console.log("    [?] dry-run; no file written");
+      pendingWrites.push({ path: filePath, code: source });
     }
   }
 
   if (failed > 0) process.exit(1);
-  console.log(`  [ok] ${patched} bundle(s) patched`);
+
+  for (const write of pendingWrites) {
+    const tmpPath = `${write.path}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, write.code, "utf8");
+    fs.renameSync(tmpPath, write.path);
+  }
+  console.log(`  [ok] ${pendingWrites.length} bundle(s) patched`);
 }
 
 if (require.main === module) main();
@@ -1145,6 +1315,7 @@ module.exports = {
   patchLegacy,
   patchCore,
   patchUsage,
+  hasReservePickerCandidate,
   hasCoreCandidate,
   hasUsageCandidate,
 };

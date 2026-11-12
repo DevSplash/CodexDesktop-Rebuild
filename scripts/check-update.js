@@ -6,10 +6,11 @@
  * 与本地记录对比，仅在有更新时输出
  *
  * 用法:
- *   node scripts/check-update.js              # 检查并对比
- *   node scripts/check-update.js --force      # 强制输出（即使无更新）
- *   node scripts/check-update.js --json       # JSON 输出
- *   node scripts/check-update.js --save       # 更新本地版本记录
+ *   node scripts/check-update.js                    # 检查并与 scripts/.versions.json 对比
+ *   node scripts/check-update.js --compare-package  # 与 package.json 已发布版本对比（用于 CI）
+ *   node scripts/check-update.js --force            # 强制输出（即使无更新）
+ *   node scripts/check-update.js --json             # JSON 输出
+ *   node scripts/check-update.js --save             # 更新本地版本记录
  */
 
 const https = require("https");
@@ -32,12 +33,13 @@ const APPCAST_ARM64 = "https://persistent.oaistatic.com/codex-app-prod/appcast.x
 const APPCAST_X64 = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
 const MS_STORE_PRODUCT_ID = "9plm9xgg6vks";
 const VERSION_FILE = path.join(__dirname, ".versions.json");
+const PACKAGE_JSON_FILE = path.join(__dirname, "..", "package.json");
 
 // ─── HTTP 辅助 ───────────────────────────────────────────────────
 function httpsGet(url) {
   return new Promise((resolve, reject) => {
-    https
-      .get(url, (res) => {
+    const req = https
+      .get(url, { timeout: 15000 }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           return httpsGet(res.headers.location).then(resolve, reject);
         }
@@ -50,6 +52,7 @@ function httpsGet(url) {
           })
         );
       })
+      .on("timeout", () => req.destroy(new Error(`HTTP timeout: ${url}`)))
       .on("error", reject);
   });
 }
@@ -147,6 +150,37 @@ function loadVersions() {
   }
 }
 
+function loadPackageBaseline() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(PACKAGE_JSON_FILE, "utf-8"));
+    return {
+      version: typeof pkg.version === "string" ? pkg.version.trim() : "",
+      upstreamVersions:
+        pkg.upstreamVersions && typeof pkg.upstreamVersions === "object"
+          ? pkg.upstreamVersions
+          : null,
+    };
+  } catch {
+    return { version: "", upstreamVersions: null };
+  }
+}
+
+function detectUpdatesAgainstPackage(results, pkgBaseline) {
+  if (pkgBaseline.upstreamVersions) {
+    return results.filter((info) => {
+      const recorded = pkgBaseline.upstreamVersions[info.platform];
+      return !recorded || recorded !== info.version;
+    });
+  }
+
+  // Fallback when package.json only has the primary release `version` field
+  // (macOS 3-part version vs Windows 4-part MSIX version).
+  const byPlat = Object.fromEntries(results.map((r) => [r.platform, r]));
+  const primary = byPlat["macOS-arm64"] || byPlat["macOS-x64"] || byPlat.Windows;
+  if (!primary) return [];
+  return primary.version !== pkgBaseline.version ? [primary] : [];
+}
+
 function saveVersions(versions) {
   fs.writeFileSync(VERSION_FILE, JSON.stringify(versions, null, 2) + "\n");
 }
@@ -163,13 +197,15 @@ function formatSize(bytes) {
 async function main() {
   const args = process.argv.slice(2);
   const force = args.includes("--force");
+  const comparePackage = args.includes("--compare-package");
   const jsonOutput = args.includes("--json");
   const doSave = args.includes("--save");
   const quiet = jsonOutput || args.includes("--quiet") || args.includes("-q");
 
   const saved = loadVersions();
+  const pkgBaseline = comparePackage ? loadPackageBaseline() : null;
   const results = [];
-  const updates = [];
+  let updates = [];
 
   const checks = await Promise.allSettled([
     checkMacArm64Version(),
@@ -181,13 +217,30 @@ async function main() {
     if (r.status === "fulfilled") {
       const info = r.value;
       results.push(info);
-      const key = info.platform;
-      const isNew = !saved[key] || saved[key].version !== info.version || saved[key].build !== info.build;
-      if (isNew) updates.push(info);
+      if (!comparePackage) {
+        const key = info.platform;
+        const isNew =
+          !saved[key] ||
+          saved[key].version !== info.version ||
+          saved[key].build !== info.build;
+        if (isNew) updates.push(info);
+      }
     } else if (!quiet) {
       console.error(`  [!] ${r.reason.message}`);
     }
   }
+
+  if (results.length === 0) {
+    throw new Error("所有上游版本源均不可达");
+  }
+
+  if (comparePackage) {
+    updates = detectUpdatesAgainstPackage(results, pkgBaseline);
+  }
+
+  const previousView = comparePackage
+    ? pkgBaseline.upstreamVersions || { version: pkgBaseline.version }
+    : saved;
 
   // JSON 输出模式
   if (jsonOutput) {
@@ -195,7 +248,7 @@ async function main() {
       timestamp: new Date().toISOString(),
       hasUpdates: updates.length > 0,
       platforms: Object.fromEntries(results.map((r) => [r.platform, r])),
-      previous: saved,
+      previous: previousView,
     };
     console.log(JSON.stringify(output, null, 2));
   } else {
@@ -207,13 +260,15 @@ async function main() {
     } else {
       for (const info of toShow) {
         const isUpdate = updates.includes(info);
-        const prevVersion = saved[info.platform]?.version || "无记录";
+        const prevVersion = comparePackage
+          ? pkgBaseline.upstreamVersions?.[info.platform] || pkgBaseline.version || "无记录"
+          : saved[info.platform]?.version || "无记录";
         const tag = isUpdate ? "🆕 新版本" : "📌 当前版本";
 
         console.log(`${tag} [${info.platform}]`);
         console.log(`  版本: ${info.version}${info.build ? ` (build ${info.build})` : ""}`);
         if (isUpdate && prevVersion !== "无记录") {
-          console.log(`  旧版: ${prevVersion}${saved[info.platform]?.build ? ` (build ${saved[info.platform].build})` : ""}`);
+          console.log(`  旧版: ${prevVersion}${!comparePackage && saved[info.platform]?.build ? ` (build ${saved[info.platform].build})` : ""}`);
         }
         if (info.pubDate) console.log(`  发布: ${info.pubDate}`);
         console.log(`  大小: ${formatSize(info.size)}`);
@@ -246,7 +301,12 @@ async function main() {
   return { results, updates };
 }
 
-module.exports = { checkMacArm64Version, checkMacX64Version, checkWindowsVersion };
+module.exports = {
+  checkMacArm64Version,
+  checkMacX64Version,
+  checkWindowsVersion,
+  detectUpdatesAgainstPackage,
+};
 
 if (require.main === module) {
   main().catch((e) => {

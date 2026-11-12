@@ -16,6 +16,9 @@ Cross-platform Electron build for OpenAI Codex Desktop App.
 # Install dependencies
 npm install
 
+# Preflight-verify all patches against latest upstream ASAR via HTTP Range
+npm run preflight
+
 # Build for current platform
 npm run build
 
@@ -56,7 +59,22 @@ Rspack async-module layout, including every emitted copy of the composer module.
 
 Fast-mode controls follow upstream authentication, model service-tier capabilities,
 and workspace requirements. The obsolete `fast_mode` authentication-comparison
-patch has been removed; API-key login does not inherit ChatGPT Fast-mode access.
+patch and `archive-delete` patch (now implemented natively upstream) have been
+removed; API-key login does not inherit ChatGPT Fast-mode access.
+
+## Patch Architecture & Upstream Resilience
+
+`scripts/patch-all.js` separates patches into two tiers so minor upstream UI
+refactors do not block releases while core safety invariants remain enforced:
+
+- **Required** (`patch-proxy-config`, `patch-windows-portable-core`, `patch-updater`, `patch-provider-quota`): must succeed or the build fails.
+- **Optional** (`patch-i18n`, `patch-copyright`, `patch-devtools`, `patch-plugin-auth`, `patch-luna-reserve`): validated atomically per script (syntax-checked with Acorn before writing); if an upstream refactor breaks an optional patch, it skips cleanly without partial writes unless `--strict` is passed.
+
+In CI (`sync.yml`), `scripts/preflight-patch.js` uses HTTP Range requests to
+fetch only `Contents/Resources/app.asar` from the upstream archive before
+launching the multi-platform build matrix, records a summary table in
+`$GITHUB_STEP_SUMMARY`, and maintains a single deduplicated `[Patch Alert]`
+GitHub Issue when any patch needs attention.
 
 ## Development
 
@@ -74,16 +92,18 @@ npm run dev
 │   ├── electron.icns    # App icon
 │   └── notification.wav # Sound
 ├── scripts/
-│   └── patch-copyright.js
+│   ├── patch-all.js
+│   └── preflight-patch.js
 ├── forge.config.js      # Electron Forge config
 └── package.json
 ```
 
 ## CI/CD
 
-GitHub Actions automatically builds on:
-- Push to `master`
-- Tag `v*` → Creates draft release
+GitHub Actions automatically checks upstream daily (`sync.yml`):
+- Compares upstream versions against `package.json` (`--compare-package`)
+- Runs Range-ASAR preflight patch check before triggering macOS, Windows, and Linux builds
+- Creates draft release with `v*` tag
 
 ## Credits
 

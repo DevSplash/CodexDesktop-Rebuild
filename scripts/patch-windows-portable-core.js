@@ -36,13 +36,17 @@ function main() {
   const isCheck = args.includes("--check");
 
   if (platform && platform !== "win") {
-    console.log("  [ok] Windows portable-core patch not applicable");
+    console.log("  [skip] Windows portable-core patch not applicable");
     return;
   }
 
   const packagePath = path.join(SRC_DIR, "win", "_asar", "package.json");
   if (!fs.existsSync(packagePath)) {
-    console.log("  [ok] Windows package metadata not found");
+    if (platform === "win") {
+      console.error(`  [x] Windows package metadata not found: ${relPath(packagePath)}`);
+      process.exit(1);
+    }
+    console.log("  [skip] Windows package metadata not present");
     return;
   }
 
@@ -50,7 +54,7 @@ function main() {
   const result = patchMetadata(metadata);
 
   if (result.status === "not-needed") {
-    console.log(`  [ok] ${relPath(packagePath)}: contained-core flag not present`);
+    console.log(`  [skip] ${relPath(packagePath)}: contained-core flag not present`);
     return;
   }
   if (result.status === "already") {
@@ -59,14 +63,14 @@ function main() {
   }
   if (isCheck) {
     console.log(
-      `  [?] ${relPath(packagePath)}: would set ${CONTAINED_CORE_FLAG} to \"0\"`,
+      `  [?] ${relPath(packagePath)}: would set ${CONTAINED_CORE_FLAG} to "0"`,
     );
     return;
   }
 
   fs.writeFileSync(packagePath, `${JSON.stringify(result.metadata, null, 2)}\n`);
   console.log(
-    `  [ok] ${relPath(packagePath)}: ${CONTAINED_CORE_FLAG} ${JSON.stringify(result.original)} -> \"0\"`,
+    `  [ok] ${relPath(packagePath)}: ${CONTAINED_CORE_FLAG} ${JSON.stringify(result.original)} -> "0"`,
   );
 }
 

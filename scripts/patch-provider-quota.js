@@ -219,13 +219,41 @@ function patchSource(source, metadata, initialImport) {
     const ownNodes = nodes(composer, () => true, true);
     const memberReads = nodes(composer, node => unwrap(node)?.type === "MemberExpression");
     const declarations = ownNodes.filter(node => node.type === "VariableDeclarator");
-    const submit = unique(ownNodes.filter(node => node.type === "Property" &&
+    const submitProps = ownNodes.filter(node => node.type === "Property" &&
       property(node) === "submitDisabled" && node.value.type === "Identifier" &&
-      declarations.some(decl => decl.id.name === node.value.name && decl.init)),
-    "Submit-disabled property");
-    const disabled = unique(declarations.filter(node => node.id.name === submit.value.name && node.init),
-      "Submit-disabled expression");
-    const referenced = new Set(nodes(disabled.init, node => node.type === "Identifier").map(node => node.name));
+      declarations.some(decl => decl.id.name === node.value.name && decl.init));
+    // 26.1103 no longer stores the quota OR in a submitDisabled local. Every
+    // gate becomes `gate&&"reason-string"` and the strings are joined into
+    // submitDisabledReasons. Collect those reads without depending on the
+    // labels: upstream renames them (the host hardBlocked gate is now labelled
+    // "reserve-limit"), while the atoms that feed the gates stay stable.
+    // "provider-blocked" is not a quota gate. It is the thread's
+    // modelProviderMismatch/NotConfigured/PolicyConflict state, and the
+    // app-server refuses to resume such threads regardless of this UI gate.
+    let disabled = null;
+    let reasonReads = null;
+    if (submitProps.length === 1) {
+      disabled = unique(declarations.filter(node => node.id.name === submitProps[0].value.name && node.init),
+        "Submit-disabled expression");
+    } else if (submitProps.length === 0) {
+      reasonReads = new Map();
+      for (const node of ownNodes) {
+        if (node.type !== "LogicalExpression" || node.operator !== "&&" ||
+          node.right.type !== "Literal" || typeof node.right.value !== "string") continue;
+        const left = node.left;
+        const guarded = left.type === "LogicalExpression" && left.operator === "&&" &&
+          left.left.type === "UnaryExpression" && left.left.operator === "!" &&
+          left.left.argument?.name === CUSTOM && left.right.type === "Identifier";
+        if (left.type !== "Identifier" && !guarded) continue;
+        const name = guarded ? left.right.name : left.name;
+        reasonReads.set(name, [...reasonReads.get(name) ?? [], node]);
+      }
+    } else {
+      throw new Error(`Submit-disabled property is ambiguous/missing (${submitProps.length})`);
+    }
+    const referenced = disabled
+      ? new Set(nodes(disabled.init, node => node.type === "Identifier").map(node => node.name))
+      : new Set(reasonReads.keys());
     const hardBlock = unique(declarations.filter(node => referenced.has(node.id.name) &&
       node.init?.type === "CallExpression" && referenceKey(node.init.arguments[0]) === hardBlockAtom &&
       node.init.arguments.length === 2), "Host quota gate");
@@ -271,8 +299,20 @@ function patchSource(source, metadata, initialImport) {
       property(unwrap(node).object) === "value")
       .map(node => unwrap(unwrap(node).object).object.name))];
     const scope = unique(scopes, "Composer scope");
-    const statement = unique(composer.body.body.filter(node => node.type === "VariableDeclaration" &&
-      node.declarations.includes(disabled)), "Submit-disabled declaration");
+    const gateRoots = disabled
+      ? [hardBlock, baseBlock].map(gate => ({ gate, root: disabled.init }))
+      : [hardBlock, baseBlock].map(gate => ({
+          gate,
+          root: unique(reasonReads.get(gate.id.name) ?? [], `Submit reason for ${gate.id.name}`),
+        }));
+    // The guard must be declared before the first gated reason read.
+    const firstRead = disabled ? null
+      : gateRoots.map(item => item.root).sort((a, b) => a.start - b.start)[0];
+    const statement = disabled
+      ? unique(composer.body.body.filter(node => node.type === "VariableDeclaration" &&
+          node.declarations.includes(disabled)), "Submit-disabled declaration")
+      : unique(composer.body.body.filter(node => node.start <= firstRead.start &&
+          firstRead.end <= node.end), "Submit-reason declaration");
     if (config.end > statement.start) throw new Error("Composer config is resolved after submission gating");
     const guard = `${MARKER}\nconst ${THREAD_PROVIDER}=(${source.slice(hardBlock.init.callee.start, hardBlock.init.callee.end)})(${threadProviderAtom},${conversation.name}),` +
       `${PROVIDER}=${THREAD_PROVIDER}??(${config.id.name}.isConfigDataPending?null:${config.id.name}.resolvedConfig?.model_provider),` +
@@ -302,11 +342,11 @@ function patchSource(source, metadata, initialImport) {
     } else {
       edits.push({ start: statement.start, end: statement.start, text: guard });
     }
-    for (const gate of [hardBlock, baseBlock]) {
-      const read = unique(nodes(disabled.init, node => node.type === "Identifier" &&
+    for (const { gate, root } of gateRoots) {
+      const read = unique(nodes(root, node => node.type === "Identifier" &&
         node.name === gate.id.name), `Submit read of ${gate.id.name}`);
       if (updating) {
-        unique(nodes(disabled.init, node => node.type === "LogicalExpression" &&
+        unique(nodes(root, node => node.type === "LogicalExpression" &&
           node.operator === "&&" && node.left.type === "UnaryExpression" &&
           node.left.operator === "!" && node.left.argument.name === CUSTOM &&
           node.right === read), `Existing guard for ${gate.id.name}`);
@@ -406,4 +446,4 @@ function main() {
 }
 
 if (require.main === module) main();
-module.exports = { MARKER, getQuotaMetadata, patchSource };
+module.exports = { MARKER, getQuotaMetadata, patchSource, quotaAtoms };

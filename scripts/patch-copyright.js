@@ -5,24 +5,15 @@
  * and replace the copyright text with a custom value, including split build chunks.
  *
  * Usage:
- *   node scripts/patch-copyright.js [platform]   # Apply patch (unix/win/omit=both)
- *   node scripts/patch-copyright.js --check       # Dry-run: report matches
+ *   node scripts/patch-copyright.js [platform]   # Apply patch (mac-arm64/mac-x64/win/unix/omit=all)
+ *   node scripts/patch-copyright.js --check      # Dry-run: report matches
  */
 const fs = require("fs");
-const path = require("path");
 const { parse } = require("acorn");
 const { locateBundles, relPath } = require("./patch-util");
 
-// ──────────────────────────────────────────────
-//  Config
-// ──────────────────────────────────────────────
-
 const OLD_COPYRIGHT = "\u00A9 OpenAI"; // (c) OpenAI
 const NEW_COPYRIGHT = "\u00A9 OpenAI \u00B7 Cometix Space"; // (c) OpenAI . Cometix Space
-
-// ──────────────────────────────────────────────
-//  AST walker
-// ──────────────────────────────────────────────
 
 function walk(node, visitor) {
   if (!node || typeof node !== "object") return;
@@ -38,10 +29,6 @@ function walk(node, visitor) {
     }
   }
 }
-
-// ──────────────────────────────────────────────
-//  Patch rule
-// ──────────────────────────────────────────────
 
 function collectPatches(ast, source) {
   const patches = [];
@@ -103,68 +90,96 @@ function collectPatches(ast, source) {
   return patches;
 }
 
-// ──────────────────────────────────────────────
-//  Main
-// ──────────────────────────────────────────────
-
 function main() {
   const args = process.argv.slice(2);
   const isCheck = args.includes("--check");
-  const platform = args.find((a) => ["mac-arm64", "mac-x64", "win"].includes(a));
+  const rawPlatform = args.find((a) => ["mac-arm64", "mac-x64", "win", "unix"].includes(a));
+  const platforms = rawPlatform === "unix" ? ["mac-arm64", "mac-x64"] : rawPlatform ? [rawPlatform] : [undefined];
 
-  const bundles = locateBundles({
-    dir: "build",
-    pattern: /\.js$/,
-    platform,
-    allMatches: true,
-  });
+  const bundles = platforms.flatMap((platform) =>
+    locateBundles({
+      dir: "build",
+      pattern: /\.js$/,
+      platform,
+      allMatches: true,
+    }),
+  );
 
   if (bundles.length === 0) {
     console.error("[x] No main-process build bundles found");
     process.exit(1);
   }
 
+  const byPlatform = new Map();
   for (const bundle of bundles) {
-    const source = fs.readFileSync(bundle.path, "utf-8");
-    if (!source.includes("copyright")) continue;
-    console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
-    console.log(`   size: ${(source.length / 1024 / 1024).toFixed(1)} MB`);
+    const list = byPlatform.get(bundle.platform) ?? [];
+    list.push(bundle);
+    byPlatform.set(bundle.platform, list);
+  }
 
-    const t0 = Date.now();
-    const ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
-    console.log(`   parse: ${Date.now() - t0}ms`);
+  let failed = 0;
+  const pendingWrites = [];
 
-    const patches = collectPatches(ast, source);
+  for (const [plat, platBundles] of byPlatform) {
+    let platMatched = 0;
 
-    if (patches.length === 0) {
-      // Check if already patched
-      if (source.includes(NEW_COPYRIGHT)) {
-        console.log("   [ok] Already patched");
-      } else {
-        console.log("   [!] No copyright property matched");
+    for (const bundle of platBundles) {
+      const source = fs.readFileSync(bundle.path, "utf-8");
+      if (!source.includes("copyright")) continue;
+      // Fast pre-filter: only parse AST when OpenAI copyright text or marker is present.
+      if (!source.includes("OpenAI")) continue;
+
+      const t0 = Date.now();
+      const ast = parse(source, { ecmaVersion: "latest", sourceType: "module" });
+      const parseMs = Date.now() - t0;
+
+      const patches = collectPatches(ast, source);
+      if (patches.length === 0) {
+        if (source.includes(NEW_COPYRIGHT)) {
+          console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
+          console.log("   [ok] Already patched");
+          platMatched++;
+        }
+        continue;
       }
-      continue;
-    }
 
-    if (isCheck) {
-      console.log(`   [?] Matches: ${patches.length}`);
+      platMatched += patches.length;
+      console.log(`\n-- [${bundle.platform}] ${relPath(bundle.path)}`);
+      console.log(`   size: ${(source.length / 1024 / 1024).toFixed(1)} MB, parse: ${parseMs}ms`);
+
+      if (isCheck) {
+        console.log(`   [?] Matches: ${patches.length}`);
+        for (const p of patches) {
+          console.log(`     > offset ${p.start}: ${p.original} -> ${p.replacement}`);
+        }
+        continue;
+      }
+
+      patches.sort((a, b) => b.start - a.start);
+      let code = source;
       for (const p of patches) {
-        console.log(`     > offset ${p.start}: ${p.original} -> ${p.replacement}`);
+        console.log(`   * offset ${p.start}: ${p.original} -> ${p.replacement}`);
+        code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
       }
-      continue;
+
+      parse(code, { ecmaVersion: "latest", sourceType: "module" });
+      pendingWrites.push({ path: bundle.path, code, count: patches.length });
     }
 
-    patches.sort((a, b) => b.start - a.start);
-    let code = source;
-    for (const p of patches) {
-      console.log(`   * offset ${p.start}: ${p.original} -> ${p.replacement}`);
-      code = code.slice(0, p.start) + p.replacement + code.slice(p.end);
+    if (platMatched === 0) {
+      console.error(`  [x] ${plat}: no copyright property or About template matched`);
+      failed++;
     }
+  }
 
-    parse(code, { ecmaVersion: "latest", sourceType: "module" });
-    fs.writeFileSync(bundle.path, code, "utf-8");
-    console.log(`   [ok] Copyright updated: ${patches.length} replacements`);
+  if (failed > 0) process.exit(1);
+
+  for (const write of pendingWrites) {
+    fs.writeFileSync(write.path, write.code, "utf-8");
+    console.log(`   [ok] ${relPath(write.path)}: Copyright updated (${write.count} replacement(s))`);
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { OLD_COPYRIGHT, NEW_COPYRIGHT, collectPatches };

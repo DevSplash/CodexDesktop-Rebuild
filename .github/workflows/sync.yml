@@ -16,8 +16,12 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     outputs:
       has_update: ${{ steps.detect.outputs.has_update }}
+      degraded_optional: ${{ steps.preflight.outputs.degraded_optional }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -35,17 +39,47 @@ jobs:
         id: detect
         run: |
           set +e
-          node scripts/check-update.js --json --force 2>&1
+          RESULT=$(node scripts/check-update.js --json --compare-package)
           exit_code=$?
           set -e
+
+          if [ -n "$RESULT" ]; then
+            echo "$RESULT"
+          fi
 
           if [ "${{ inputs.force }}" = "true" ]; then
             echo "has_update=true" >> "$GITHUB_OUTPUT"
           elif [ $exit_code -eq 0 ]; then
             echo "has_update=true" >> "$GITHUB_OUTPUT"
-          else
+          elif [ $exit_code -eq 1 ]; then
             echo "has_update=false" >> "$GITHUB_OUTPUT"
-            echo "No upstream update detected."
+            echo "No upstream update detected (matches package.json)."
+          else
+            echo "Upstream version check failed with exit code $exit_code."
+            exit $exit_code
+          fi
+
+      - name: Preflight upstream patches
+        id: preflight
+        if: steps.detect.outputs.has_update == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          node scripts/preflight-patch.js --report patch-report.json --summary
+          preflight_exit=$?
+          set -e
+
+          if [ -f patch-report.json ]; then
+            DEGRADED=$(node -e "const fs=require('fs'),r=JSON.parse(fs.readFileSync('patch-report.json','utf8'));console.log((r.optionalFailed||[]).join(', '))")
+            echo "degraded_optional=$DEGRADED" >> "$GITHUB_OUTPUT"
+            node scripts/ci-patch-alert.js patch-report.json
+            rm -f patch-report.json
+          fi
+
+          if [ $preflight_exit -ne 0 ]; then
+            echo "Preflight check failed on required patch(es); aborting platform builds."
+            exit $preflight_exit
           fi
 
   # ──────────────────────────────────────────────
@@ -212,6 +246,8 @@ jobs:
 
       - name: Get upstream version and tag
         id: version
+        env:
+          DEGRADED_OPTIONAL: ${{ needs.check.outputs.degraded_optional }}
         run: |
           RESULT=$(node scripts/check-update.js --json --force)
           MAC_ARM64=$(echo "$RESULT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);console.log(j.platforms?.['macOS-arm64']?.version||'')}catch{console.log('')}})")
@@ -224,13 +260,44 @@ jobs:
           echo "mac_x64=$MAC_X64" >> "$GITHUB_OUTPUT"
           echo "win_version=$WIN_VER" >> "$GITHUB_OUTPUT"
 
+          BODY=$(MAC_ARM64="$MAC_ARM64" MAC_X64="$MAC_X64" WIN_VER="$WIN_VER" node -e '
+            const lines = [
+              "## Upstream Versions",
+              "| Platform | Version |",
+              "|----------|---------|",
+              `| macOS arm64 | \`${process.env.MAC_ARM64 || "N/A"}\` |`,
+              `| macOS x64 | \`${process.env.MAC_X64 || "N/A"}\` |`,
+              `| Windows x64 | \`${process.env.WIN_VER || "N/A"}\` |`,
+              "| Linux | uses macOS ASAR with its exact matching openai/codex Linux resources |",
+            ];
+            if (process.env.DEGRADED_OPTIONAL) {
+              lines.push(
+                "",
+                "## Patch Notes",
+                `> ⚠️ Optional patch(es) skipped due to upstream bundle changes: \`${process.env.DEGRADED_OPTIONAL}\``,
+              );
+            }
+            console.log(lines.join("\n"));
+          ')
+          {
+            echo "release_body<<EOF_RELEASE_BODY"
+            echo "$BODY"
+            echo "EOF_RELEASE_BODY"
+          } >> "$GITHUB_OUTPUT"
+
           if [ -z "$VERSION" ]; then echo "No version detected"; exit 0; fi
 
-          node -e "
-            const fs=require('fs'), p=JSON.parse(fs.readFileSync('package.json','utf8'));
-            p.version='$VERSION';
-            fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');
-          "
+          MAC_ARM64="$MAC_ARM64" MAC_X64="$MAC_X64" WIN_VER="$WIN_VER" VERSION="$VERSION" node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            p.version = process.env.VERSION;
+            const uv = { ...(p.upstreamVersions || {}) };
+            if (process.env.MAC_ARM64) uv["macOS-arm64"] = process.env.MAC_ARM64;
+            if (process.env.MAC_X64) uv["macOS-x64"] = process.env.MAC_X64;
+            if (process.env.WIN_VER) uv.Windows = process.env.WIN_VER;
+            p.upstreamVersions = uv;
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          '
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -239,8 +306,12 @@ jobs:
           git diff --cached --quiet && echo "No version change" && exit 0
 
           git commit -m "Bump version to ${VERSION}"
-          git tag -a "v${VERSION}" -m "Codex ${VERSION}"
-          git push origin HEAD --tags
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            git push origin HEAD
+          else
+            git tag -a "v${VERSION}" -m "Codex ${VERSION}"
+            git push origin HEAD --tags
+          fi
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
@@ -256,14 +327,7 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: Codex ${{ steps.version.outputs.version }}
-          body: |
-            ## Upstream Versions
-            | Platform | Version |
-            |----------|---------|
-            | macOS arm64 | `${{ steps.version.outputs.mac_arm64 || 'N/A' }}` |
-            | macOS x64 | `${{ steps.version.outputs.mac_x64 || 'N/A' }}` |
-            | Windows x64 | `${{ steps.version.outputs.win_version || 'N/A' }}` |
-            | Linux | uses macOS ASAR with its exact matching openai/codex Linux resources |
+          body: ${{ steps.version.outputs.release_body }}
           files: |
             artifacts/**/*.dmg
             artifacts/**/*.zip
