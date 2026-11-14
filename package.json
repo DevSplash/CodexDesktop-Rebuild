@@ -1,7 +1,7 @@
 {
   "name": "codex-rebuild",
   "productName": "Codex",
-  "version": "26.1103.41825",
+  "version": "26.1111.21308",
   "description": "Codex Electron App - Cross-platform Build",
   "main": "src/.vite/build/bootstrap.js",
   "scripts": {
@@ -66,5 +66,10 @@
   "codexBuildFlavor": "prod",
   "codexBuildNumber": "1272",
   "codexSparkleFeedUrl": "https://persistent.oaistatic.com/codex-app-prod/appcast.xml",
-  "codexSparklePublicKey": "rhcBvttuqDFriyNqwTQJR3L4UT1WjIK4QxtwtwusVic="
+  "codexSparklePublicKey": "rhcBvttuqDFriyNqwTQJR3L4UT1WjIK4QxtwtwusVic=",
+  "upstreamVersions": {
+    "macOS-arm64": "26.1111.21308",
+    "macOS-x64": "26.1111.21308",
+    "Windows": "26.1111.2228.0"
+  }
 }
