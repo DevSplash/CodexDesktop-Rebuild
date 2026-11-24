@@ -152,6 +152,21 @@ function exportedQuotaAtoms(source) {
   return [...quotaAtoms(ast, source)].map(name => exportFor(ast, name)).filter(Boolean);
 }
 
+function exportedCombinedQuotaAtoms(source, hardBlockSource, hardBlockExport) {
+  const ast = parseModule(source);
+  const localHardBlock = importedLocal(ast, hardBlockSource, hardBlockExport);
+  if (!localHardBlock) return [];
+  const localQuotas = quotaAtoms(ast, source);
+  if (!localQuotas.size) return [];
+  return nodes(ast, node => {
+    const item = binding(node);
+    if (item?.init?.type !== "CallExpression") return false;
+    return item.init.arguments.some(arg => arg.type === "ArrowFunctionExpression" &&
+      nodes(arg, child => child.type === "Identifier" && child.name === localHardBlock).length > 0 &&
+      nodes(arg, child => child.type === "Identifier" && localQuotas.has(child.name)).length > 0);
+  }).map(node => exportFor(ast, binding(node).name)).filter(Boolean);
+}
+
 function unique(items, label) {
   if (items.length !== 1) throw new Error(`${label} is ambiguous/missing (${items.length})`);
   return items[0];
@@ -182,12 +197,17 @@ function patchSource(source, metadata, initialImport) {
       : node?.type === "MemberExpression" ? `${source.slice(node.object.start, node.object.end)}[${JSON.stringify(property(node))}]` : null;
     const hardBlockAtom = metadata.rspackReferences?.[0] ??
       importedLocal(ast, initialImport, metadata.hardBlockExport);
+    let combinedQuotaAtom = metadata.rspackReferences?.[3] ?? null;
+    for (const { source: from, name } of metadata.combinedQuotaImports ?? []) {
+      const local = importedLocal(ast, from, name);
+      if (local) combinedQuotaAtom = local;
+    }
     let threadProviderAtom = metadata.rspackReferences?.[1] ??
       importedLocal(ast, metadata.threadProviderImport.source, metadata.threadProviderImport.name);
     // 26.1021's composer no longer imports the thread-provider atom, although
     // the module that exports it is still imported. Add it to that import.
     let providerImportEdit = null;
-    if (hardBlockAtom && !threadProviderAtom) {
+    if ((hardBlockAtom || combinedQuotaAtom) && !threadProviderAtom) {
       const declaration = ast.body.find(node => node.type === "ImportDeclaration" &&
         node.source.value === metadata.threadProviderImport.source &&
         node.specifiers.length > 0 && node.specifiers.every(s => s.type === "ImportSpecifier"));
@@ -201,13 +221,15 @@ function patchSource(source, metadata, initialImport) {
         };
       }
     }
-    if (!hardBlockAtom || !threadProviderAtom) throw new Error("Composer quota/provider imports not found");
+    if ((!hardBlockAtom && !combinedQuotaAtom) || !threadProviderAtom) {
+      throw new Error("Composer quota/provider imports not found");
+    }
     if (!updating && [CUSTOM, PROVIDER, THREAD_PROVIDER, PROVIDER_CONFIG]
       .some(name => source.includes(name))) {
       throw new Error("Custom-provider patch binding already exists without its marker");
     }
     const nativeQuotaAtoms = quotaAtoms(ast, source);
-    if (metadata.rspackReferences) nativeQuotaAtoms.add(metadata.rspackReferences[2]);
+    if (metadata.rspackReferences?.[2]) nativeQuotaAtoms.add(metadata.rspackReferences[2]);
     for (const { source: from, name } of metadata.quotaImports ?? []) {
       const local = importedLocal(ast, from, name);
       if (local) nativeQuotaAtoms.add(local);
@@ -219,59 +241,26 @@ function patchSource(source, metadata, initialImport) {
     const ownNodes = nodes(composer, () => true, true);
     const memberReads = nodes(composer, node => unwrap(node)?.type === "MemberExpression");
     const declarations = ownNodes.filter(node => node.type === "VariableDeclarator");
-    const submitProps = ownNodes.filter(node => node.type === "Property" &&
-      property(node) === "submitDisabled" && node.value.type === "Identifier" &&
-      declarations.some(decl => decl.id.name === node.value.name && decl.init));
-    // 26.1103 no longer stores the quota OR in a submitDisabled local. Every
-    // gate becomes `gate&&"reason-string"` and the strings are joined into
-    // submitDisabledReasons. Collect those reads without depending on the
-    // labels: upstream renames them (the host hardBlocked gate is now labelled
-    // "reserve-limit"), while the atoms that feed the gates stay stable.
-    // "provider-blocked" is not a quota gate. It is the thread's
-    // modelProviderMismatch/NotConfigured/PolicyConflict state, and the
-    // app-server refuses to resume such threads regardless of this UI gate.
-    let disabled = null;
-    let reasonReads = null;
-    if (submitProps.length === 1) {
-      disabled = unique(declarations.filter(node => node.id.name === submitProps[0].value.name && node.init),
-        "Submit-disabled expression");
-    } else if (submitProps.length === 0) {
-      reasonReads = new Map();
-      for (const node of ownNodes) {
-        if (node.type !== "LogicalExpression" || node.operator !== "&&" ||
-          node.right.type !== "Literal" || typeof node.right.value !== "string") continue;
-        const left = node.left;
-        const guarded = left.type === "LogicalExpression" && left.operator === "&&" &&
-          left.left.type === "UnaryExpression" && left.left.operator === "!" &&
-          left.left.argument?.name === CUSTOM && left.right.type === "Identifier";
-        if (left.type !== "Identifier" && !guarded) continue;
-        const name = guarded ? left.right.name : left.name;
-        reasonReads.set(name, [...reasonReads.get(name) ?? [], node]);
-      }
-    } else {
-      throw new Error(`Submit-disabled property is ambiguous/missing (${submitProps.length})`);
-    }
-    const referenced = disabled
-      ? new Set(nodes(disabled.init, node => node.type === "Identifier").map(node => node.name))
-      : new Set(reasonReads.keys());
-    const hardBlock = unique(declarations.filter(node => referenced.has(node.id.name) &&
-      node.init?.type === "CallExpression" && referenceKey(node.init.arguments[0]) === hardBlockAtom &&
-      node.init.arguments.length === 2), "Host quota gate");
-    const directAccountGate = declarations.filter(node => referenced.has(node.id.name) && node.init &&
-      nodes(node.init, child => child.type === "CallExpression" && child.arguments.length === 1 &&
-        nativeQuotaAtoms.has(referenceKey(child.arguments[0]))).length > 0);
-    // 26.1013 reads the same account-quota atom through a host check:
-    // X(host === "local" && quotaAtom). Keep the direct call when it exists.
-    const indirectAccountGate = declarations.filter(node => referenced.has(node.id.name) && node.init &&
-      nodes(node.init, child => nativeQuotaAtoms.has(referenceKey(child))).length > 0);
-    const baseBlock = unique(directAccountGate.length ? directAccountGate : indirectAccountGate,
-      "Account quota gate");
+
     const configNames = new Set(memberReads.filter(node => property(node) === "resolvedConfig")
       .map(node => unwrap(node).object.name));
     const pendingNames = new Set(memberReads.filter(node => property(node) === "isConfigDataPending")
       .map(node => unwrap(node).object.name));
-    const config = unique(declarations.filter(node => configNames.has(node.id.name) &&
-      pendingNames.has(node.id.name) && node.init?.type === "CallExpression"), "Resolved composer config");
+    const configMatches = [];
+    for (const node of declarations) {
+      if (node.init?.type !== "CallExpression") continue;
+      if (node.id.type === "Identifier" && configNames.has(node.id.name) && pendingNames.has(node.id.name)) {
+        configMatches.push({ decl: node, name: node.id.name });
+      } else if (node.id.type === "ObjectPattern") {
+        for (const prop of node.id.properties) {
+          if (prop.type === "Property" && prop.value?.type === "Identifier" &&
+              configNames.has(prop.value.name) && pendingNames.has(prop.value.name)) {
+            configMatches.push({ decl: node, name: prop.value.name });
+          }
+        }
+      }
+    }
+    const { decl: config, name: configVarName } = unique(configMatches, "Resolved composer config");
     const target = config.init.arguments[0];
     const targets = target?.type === "ObjectExpression" ? [target] : ownNodes
       .map(binding).filter(item => item?.name === target?.name && item.init?.type === "ObjectExpression")
@@ -292,35 +281,141 @@ function patchSource(source, metadata, initialImport) {
       }
       return name;
     }
-    if (resolveAlias(host.name) !== resolveAlias(hardBlock.init.arguments[1].name)) {
-      throw new Error("Composer config and quota hosts differ");
-    }
     const scopes = [...new Set(ownNodes.filter(node => property(node) === "kind" &&
       property(unwrap(node).object) === "value")
       .map(node => unwrap(unwrap(node).object).object.name))];
     const scope = unique(scopes, "Composer scope");
-    const gateRoots = disabled
-      ? [hardBlock, baseBlock].map(gate => ({ gate, root: disabled.init }))
-      : [hardBlock, baseBlock].map(gate => ({
-          gate,
-          root: unique(reasonReads.get(gate.id.name) ?? [], `Submit reason for ${gate.id.name}`),
-        }));
-    // The guard must be declared before the first gated reason read.
-    const firstRead = disabled ? null
-      : gateRoots.map(item => item.root).sort((a, b) => a.start - b.start)[0];
-    const statement = disabled
-      ? unique(composer.body.body.filter(node => node.type === "VariableDeclaration" &&
-          node.declarations.includes(disabled)), "Submit-disabled declaration")
-      : unique(composer.body.body.filter(node => node.start <= firstRead.start &&
-          firstRead.end <= node.end), "Submit-reason declaration");
+
+    // 26.1120+ subscribes to a single combined quota-reasons selector atom in
+    // the composer and appends its string directly into submitDisabledReasons.
+    const combinedGates = combinedQuotaAtom
+      ? declarations.filter(node =>
+          node.init?.type === "CallExpression" &&
+          referenceKey(node.init.arguments[0]) === combinedQuotaAtom &&
+          node.init.arguments.length === 2)
+      : [];
+
+    let statement = null;
+    let atomReaderCallee = null;
+    const readEdits = [];
+
+    if (combinedGates.length > 0) {
+      const combinedGate = unique(combinedGates, "Combined quota-reasons gate");
+      if (resolveAlias(host.name) !== resolveAlias(combinedGate.init.arguments[1].name)) {
+        throw new Error("Composer config and quota hosts differ");
+      }
+      atomReaderCallee = combinedGate.init.callee;
+      const gateName = combinedGate.id.name;
+      const gateReads = ownNodes.filter(node =>
+        node.type === "Identifier" && node.name === gateName && node.start > combinedGate.end);
+      if (gateReads.length === 0) {
+        throw new Error(`No composer reads of combined quota gate ${gateName}`);
+      }
+      statement = unique(
+        composer.body.body.filter(node => node.start <= gateReads[0].start && gateReads[0].end <= node.end),
+        "Combined submit-reason statement",
+      );
+      if (gateReads.some(read => read.start < statement.start || read.end > statement.end)) {
+        throw new Error(`Combined quota gate ${gateName} is read across multiple statements`);
+      }
+      if (!source.slice(statement.start, statement.end).includes(".filter(Boolean)")) {
+        throw new Error("Combined submit-reason statement lacks .filter(Boolean)");
+      }
+      if (nodes(statement, node => node.type === "AssignmentExpression" && node.left === gateReads.find(r => r === node.left), true).length > 0) {
+        throw new Error(`Combined quota gate ${gateName} is unexpectedly reassigned`);
+      }
+      for (const read of gateReads) {
+        if (updating) {
+          unique(nodes(statement, node => node.type === "LogicalExpression" &&
+            node.operator === "&&" && node.left.type === "UnaryExpression" &&
+            node.left.operator === "!" && node.left.argument.name === CUSTOM &&
+            node.right === read, true), `Existing guard for ${gateName}`);
+        } else {
+          readEdits.push({ start: read.start, end: read.end, text: `(!${CUSTOM}&&${gateName})` });
+        }
+      }
+    } else {
+      const submitProps = ownNodes.filter(node => node.type === "Property" &&
+        property(node) === "submitDisabled" && node.value.type === "Identifier" &&
+        declarations.some(decl => decl.id.name === node.value.name && decl.init));
+      // 26.1103..26.1111 stores each gate as `gate&&"reason-string"` and joins
+      // them into submitDisabledReasons. Collect those reads without depending
+      // on the labels: upstream renames them ("reserve-limit" vs "usage-limit").
+      let disabled = null;
+      let reasonReads = null;
+      if (submitProps.length === 1) {
+        disabled = unique(declarations.filter(node => node.id.name === submitProps[0].value.name && node.init),
+          "Submit-disabled expression");
+      } else if (submitProps.length === 0) {
+        reasonReads = new Map();
+        for (const node of ownNodes) {
+          if (node.type !== "LogicalExpression" || node.operator !== "&&" ||
+            node.right.type !== "Literal" || typeof node.right.value !== "string") continue;
+          const left = node.left;
+          const guarded = left.type === "LogicalExpression" && left.operator === "&&" &&
+            left.left.type === "UnaryExpression" && left.left.operator === "!" &&
+            left.left.argument?.name === CUSTOM && left.right.type === "Identifier";
+          if (left.type !== "Identifier" && !guarded) continue;
+          const name = guarded ? left.right.name : left.name;
+          reasonReads.set(name, [...reasonReads.get(name) ?? [], node]);
+        }
+      } else {
+        throw new Error(`Submit-disabled property is ambiguous/missing (${submitProps.length})`);
+      }
+      const referenced = disabled
+        ? new Set(nodes(disabled.init, node => node.type === "Identifier").map(node => node.name))
+        : new Set(reasonReads.keys());
+      const hardBlock = unique(declarations.filter(node => referenced.has(node.id.name) &&
+        node.init?.type === "CallExpression" && referenceKey(node.init.arguments[0]) === hardBlockAtom &&
+        node.init.arguments.length === 2), "Host quota gate");
+      const directAccountGate = declarations.filter(node => referenced.has(node.id.name) && node.init &&
+        nodes(node.init, child => child.type === "CallExpression" && child.arguments.length === 1 &&
+          nativeQuotaAtoms.has(referenceKey(child.arguments[0]))).length > 0);
+      // 26.1013 reads the same account-quota atom through a host check:
+      // X(host === "local" && quotaAtom). Keep the direct call when it exists.
+      const indirectAccountGate = declarations.filter(node => referenced.has(node.id.name) && node.init &&
+        nodes(node.init, child => nativeQuotaAtoms.has(referenceKey(child))).length > 0);
+      const baseBlock = unique(directAccountGate.length ? directAccountGate : indirectAccountGate,
+        "Account quota gate");
+      if (resolveAlias(host.name) !== resolveAlias(hardBlock.init.arguments[1].name)) {
+        throw new Error("Composer config and quota hosts differ");
+      }
+      atomReaderCallee = hardBlock.init.callee;
+      const gateRoots = disabled
+        ? [hardBlock, baseBlock].map(gate => ({ gate, root: disabled.init }))
+        : [hardBlock, baseBlock].map(gate => ({
+            gate,
+            root: unique(reasonReads.get(gate.id.name) ?? [], `Submit reason for ${gate.id.name}`),
+          }));
+      const firstRead = disabled ? null
+        : gateRoots.map(item => item.root).sort((a, b) => a.start - b.start)[0];
+      statement = disabled
+        ? unique(composer.body.body.filter(node => node.type === "VariableDeclaration" &&
+            node.declarations.includes(disabled)), "Submit-disabled declaration")
+        : unique(composer.body.body.filter(node => node.start <= firstRead.start &&
+            firstRead.end <= node.end), "Submit-reason declaration");
+      for (const { gate, root } of gateRoots) {
+        const read = unique(nodes(root, node => node.type === "Identifier" &&
+          node.name === gate.id.name), `Submit read of ${gate.id.name}`);
+        if (updating) {
+          unique(nodes(root, node => node.type === "LogicalExpression" &&
+            node.operator === "&&" && node.left.type === "UnaryExpression" &&
+            node.left.operator === "!" && node.left.argument.name === CUSTOM &&
+            node.right === read), `Existing guard for ${gate.id.name}`);
+        } else {
+          readEdits.push({ start: read.start, end: read.end, text: `(!${CUSTOM}&&${gate.id.name})` });
+        }
+      }
+    }
+
     if (config.end > statement.start) throw new Error("Composer config is resolved after submission gating");
-    const guard = `${MARKER}\nconst ${THREAD_PROVIDER}=(${source.slice(hardBlock.init.callee.start, hardBlock.init.callee.end)})(${threadProviderAtom},${conversation.name}),` +
-      `${PROVIDER}=${THREAD_PROVIDER}??(${config.id.name}.isConfigDataPending?null:${config.id.name}.resolvedConfig?.model_provider),` +
-      `${PROVIDER_CONFIG}=${config.id.name}.isConfigDataPending?null:${config.id.name}.resolvedConfig?.model_providers?.[${PROVIDER}],` +
+    const guard = `${MARKER}\nconst ${THREAD_PROVIDER}=(${source.slice(atomReaderCallee.start, atomReaderCallee.end)})(${threadProviderAtom},${conversation.name}),` +
+      `${PROVIDER}=${THREAD_PROVIDER}??(${configVarName}.isConfigDataPending?null:${configVarName}.resolvedConfig?.model_provider),` +
+      `${PROVIDER_CONFIG}=${configVarName}.isConfigDataPending?null:${configVarName}.resolvedConfig?.model_providers?.[${PROVIDER}],` +
       `${CUSTOM}=(${scope}.value.kind===\`local\`||${scope}.value.kind===\`new\`&&!${scope}.value.cloudThreadPrototype)` +
       `&&typeof ${PROVIDER}===\`string\`&&${PROVIDER}.trim().length>0&&${PROVIDER}!==\`openai\`` +
       `&&(${hasExternalBaseUrl.toString()})(${PROVIDER_CONFIG});`;
-    const edits = providerImportEdit ? [providerImportEdit] : [];
+    const edits = [...(providerImportEdit ? [providerImportEdit] : []), ...readEdits];
     if (updating) {
       // Upgrade the previous provider-ID-only guard as well as fresh sources.
       // Keep the existing hook and quota-gate reads in their original positions.
@@ -342,18 +437,6 @@ function patchSource(source, metadata, initialImport) {
     } else {
       edits.push({ start: statement.start, end: statement.start, text: guard });
     }
-    for (const { gate, root } of gateRoots) {
-      const read = unique(nodes(root, node => node.type === "Identifier" &&
-        node.name === gate.id.name), `Submit read of ${gate.id.name}`);
-      if (updating) {
-        unique(nodes(root, node => node.type === "LogicalExpression" &&
-          node.operator === "&&" && node.left.type === "UnaryExpression" &&
-          node.left.operator === "!" && node.left.argument.name === CUSTOM &&
-          node.right === read), `Existing guard for ${gate.id.name}`);
-      } else {
-        edits.push({ start: read.start, end: read.end, text: `(!${CUSTOM}&&${gate.id.name})` });
-      }
-    }
     let code = source;
     for (const edit of edits.sort((a, b) => b.start - a.start)) {
       code = code.slice(0, edit.start) + edit.text + code.slice(edit.end);
@@ -369,11 +452,23 @@ function patchSource(source, metadata, initialImport) {
   }
 }
 
+function resolvePlatforms(platform) {
+  if (platform === "unix") return ["mac-arm64", "mac-x64"];
+  if (platform) return [platform];
+  return ["mac-arm64", "mac-x64", "win"];
+}
+
+function writeAtomic(filePath, content) {
+  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmpPath, content, "utf8");
+  fs.renameSync(tmpPath, filePath);
+}
+
 function main() {
   const args = process.argv.slice(2);
   const platform = args.find(arg => PLATFORMS.includes(arg));
   const check = args.includes("--check");
-  const directories = (platform ? [platform] : PLATFORMS)
+  const directories = resolvePlatforms(platform)
     .map(plat => ({ platform: plat, path: path.join(SRC_DIR, plat, "_asar", "webview", "assets") }))
     .filter(dir => fs.existsSync(dir.path));
   const legacy = path.join(SRC_DIR, "webview", "assets");
@@ -394,7 +489,7 @@ function main() {
           const filePath = path.join(directory.path, ...file.name.split("/"));
           console.log(`  [${directory.platform}] ${relPath(filePath)}`);
           if (check) console.log("    [?] dry-run; no file written");
-          else { fs.writeFileSync(filePath, code, "utf8"); patched++; }
+          else { writeAtomic(filePath, code); patched++; }
         }
         console.log(`    [ok] ${result.copies} Rspack composer copies ${result.outputs.length ? "matched" : "already patched"}`);
         continue;
@@ -412,15 +507,20 @@ function main() {
         metadata.threadProviderImport.source = `./${initial.name}`;
       }
       const primary = unique(files.filter(file => file.name !== initial.name &&
-        file.source.includes(`./${initial.name}`) && file.source.includes("submitDisabled") &&
-        file.source.includes("resolvedConfig") && file.source.includes("isConfigDataPending")),
+        file.source.includes("submitDisabled") &&
+        file.source.includes("resolvedConfig") && file.source.includes("isConfigDataPending") &&
+        (file.source.includes(`./${initial.name}`) || file.source.includes("submitDisabledReasons"))),
       "Composer bundle");
       metadata.quotaImports = [];
+      metadata.combinedQuotaImports = [];
       for (const file of files) {
         if (file.name === primary.name || !primary.source.includes(`"./${file.name}"`)) continue;
         if (!["authenticatedAccountId", "windowMinutes", "resetsAt"].every(key => file.source.includes(key))) continue;
         for (const name of exportedQuotaAtoms(file.source)) {
           metadata.quotaImports.push({ source: `./${file.name}`, name });
+        }
+        for (const name of exportedCombinedQuotaAtoms(file.source, `./${initial.name}`, metadata.hardBlockExport)) {
+          metadata.combinedQuotaImports.push({ source: `./${file.name}`, name });
         }
       }
       const result = patchSource(primary.source, metadata, `./${initial.name}`);
@@ -431,7 +531,7 @@ function main() {
         console.log("    [ok] Custom-provider quota patch already applied");
       } else {
         for (const change of result.changes) console.log(`    * ${change}`);
-        if (!check) { fs.writeFileSync(filePath, result.code, "utf8"); patched++; }
+        if (!check) { writeAtomic(filePath, result.code); patched++; }
         else console.log("    [?] dry-run; no file written");
       }
     } catch (error) {

@@ -75,6 +75,7 @@ function bindings(module) {
     return JSON.stringify([imports.get(node.object.name), key(node.property)]);
   }
   function reference(originKey) {
+    if (!originKey) return null;
     const [id, name] = JSON.parse(originKey);
     const alias = [...imports].find(([, imported]) => imported === id)?.[0];
     return alias ? `${alias}[${JSON.stringify(name)}]` : null;
@@ -94,6 +95,7 @@ function patchRspackFiles(files, { patchSource, quotaAtoms }) {
   const hostAtoms = [];
   const providerAtoms = [];
   const accountAtoms = [];
+  const localQuotaByModule = new Map();
   const parsed = new Map();
   for (const module of modules) {
     const data = bindings(module);
@@ -106,7 +108,9 @@ function patchRspackFiles(files, { patchSource, quotaAtoms }) {
         hostAtoms.push(JSON.stringify([module.id, data.exports.get(node.id.name)]));
       }
     }
-    for (const name of quotaAtoms(data.ast, module.source)) {
+    const localQuotas = quotaAtoms(data.ast, module.source);
+    localQuotaByModule.set(module, localQuotas);
+    for (const name of localQuotas) {
       if (data.exports.has(name)) accountAtoms.push(JSON.stringify([module.id, data.exports.get(name)]));
     }
     for (const node of findNodes(data.ast, node => node.type === "LogicalExpression" &&
@@ -120,19 +124,46 @@ function patchRspackFiles(files, { patchSource, quotaAtoms }) {
   const host = unique(hostAtoms, "Rspack host quota atom");
   const provider = unique(providerAtoms, "Rspack saved-thread provider atom");
   const account = unique(accountAtoms, "Rspack account quota atom");
+
+  // 26.1120+ combines the host hardBlocked check and the account usage-limit
+  // check into one exported selector atom so the composer only subscribes once.
+  const combinedAtoms = [];
+  for (const module of modules) {
+    const data = parsed.get(module);
+    const localQuotas = localQuotaByModule.get(module);
+    for (const node of findNodes(data.ast, node => node.type === "VariableDeclarator" &&
+      node.init?.type === "CallExpression" && data.exports.has(node.id.name))) {
+      const combinesBoth = node.init.arguments.some(arg => arg.type === "ArrowFunctionExpression" &&
+        findNodes(arg, child => data.origin(child) === host).length > 0 &&
+        findNodes(arg, child => (child.type === "Identifier" && localQuotas.has(child.name)) ||
+          data.origin(child) === account).length > 0);
+      if (combinesBoth) {
+        combinedAtoms.push(JSON.stringify([module.id, data.exports.get(node.id.name)]));
+      }
+    }
+  }
+  const combined = combinedAtoms.length
+    ? unique(combinedAtoms, "Rspack combined quota-reasons atom")
+    : null;
+
   const composers = modules.filter(module => {
     const data = parsed.get(module);
-    return data.reference(host) && data.ast.body.some(node => node.type === "FunctionDeclaration" &&
-      findNodes(node, child => child.type === "Property" && key(child.key) === "submitDisabled", true).length &&
-      findNodes(node, child => child.type === "MemberExpression" && key(child.property) === "resolvedConfig").length);
+    return (data.reference(host) || data.reference(combined)) &&
+      data.ast.body.some(node => node.type === "FunctionDeclaration" &&
+        findNodes(node, child => child.type === "Property" && key(child.key) === "submitDisabled", true).length &&
+        findNodes(node, child => child.type === "MemberExpression" && key(child.property) === "resolvedConfig").length);
   });
   unique(composers.map(module => module.id), "Rspack composer module");
   const updates = new Map();
   const changes = [];
   for (const module of composers) {
     const data = parsed.get(module);
-    const references = [host, provider, account].map(origin => data.reference(origin));
-    if (references.some(ref => !ref)) throw new Error("Rspack composer quota/provider imports missing");
+    const references = [host, provider, account, combined].map(origin => data.reference(origin));
+    const hasSplitRefs = Boolean(references[0] && references[2]);
+    const hasCombinedRef = Boolean(references[3]);
+    if (!references[1] || (!hasSplitRefs && !hasCombinedRef)) {
+      throw new Error("Rspack composer quota/provider imports missing");
+    }
     const result = patchSource(module.source, { rspackReferences: references });
     if (result.status === "error") throw new Error(`${module.file.name}: ${result.reason}`);
     if (result.status === "already") continue;

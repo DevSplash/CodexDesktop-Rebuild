@@ -45,6 +45,10 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\[\]\\]/g, "\\$&");
 }
 
+function hasMoonGlyph(text) {
+  return text.includes("🌙") || /\\u\{1f319\}|\\ud83c\\udf19/i.test(text);
+}
+
 function replaceMatch(source, match, replacement) {
   return source.slice(0, match.index) + replacement + source.slice(match.index + match[0].length);
 }
@@ -313,9 +317,15 @@ function patchCurrent(source) {
       label: "show the Luna marker only when Luna is selected",
     },
     {
-      re: new RegExp(`displayName:${escapeRegExp(reserveActiveVar)}\\?(${IDENT})\\?\\.displayName:`, "g"),
-      replacement: (_match, reserveDisplay) =>
-        `displayName:(${modeExpr})?${reserveDisplay}?.displayName:`,
+      // 26.1120 hoists the displayName ternary into a local before the JSX cache check.
+      re: new RegExp(
+        `displayName:${escapeRegExp(reserveActiveVar)}\\?(${IDENT})\\?\\.displayName:|((?:let\\s+|[;,])${IDENT}=)${escapeRegExp(reserveActiveVar)}\\?(${IDENT})\\?\\.displayName:(${IDENT}\\?\\.displayName)`,
+        "g",
+      ),
+      replacement: (_match, inlineDisplay, declPrefix, hoistedReserve, hoistedNormal) =>
+        inlineDisplay
+          ? `displayName:(${modeExpr})?${inlineDisplay}?.displayName:`
+          : `${declPrefix}(${modeExpr})?${hoistedReserve}?.displayName:${hoistedNormal}`,
       label: "use the selected model name in the compact trigger",
     },
   ];
@@ -326,7 +336,7 @@ function patchCurrent(source) {
       // 26.1103 draws the moon inside selectedLabel, which the previous
       // replacement already limits to the selected Reserve model.
       if (label === "show the Luna marker only when Luna is selected" &&
-          code.includes(`selectedLabel:(${modeExpr})?`) && code.includes("🌙")) {
+          code.includes(`selectedLabel:(${modeExpr})?`) && hasMoonGlyph(code)) {
         changes.push("keep the Reserve icon on the selected Reserve label");
         continue;
       }
@@ -415,45 +425,37 @@ function patchCurrent(source) {
     }
     effortToggles.push(effortToggle);
   }
-  if (effortToggles.length === 0) {
+  for (const toggle of [...effortToggles].reverse()) {
+    code = replaceMatch(code, toggle, `${toggle[1]}${toggle[2]}=${toggle[3]}`);
+  }
+
+  // Inline JSX builds (both older Vite and 26.1120+ Rspack) write
+  // `modelSelectionDisabled: disabled || null != footer` (or `footer != null`)
+  // directly on the compact/popover menu props.
+  const inlineToggleRe = new RegExp(
+    `modelSelectionDisabled:(${IDENT})\\|\\|(?:null!=)?(${IDENT})(?:!=null)?(?=[,}])`,
+    "g",
+  );
+  const inlineToggles = [];
+  let inlineToggle;
+  while ((inlineToggle = inlineToggleRe.exec(code))) {
+    const nearby = code.slice(Math.max(0, inlineToggle.index - 700), inlineToggle.index + 200);
+    if (!nearby.includes(`menuFooter:${inlineToggle[2]}`)) continue;
+    inlineToggles.push(inlineToggle);
+  }
+
+  if (effortToggles.length === 0 && inlineToggles.length === 0) {
     return {
       detected: true,
       ok: false,
       reason: "model picker effort-toggle disable hook not found",
     };
   }
-  for (const toggle of effortToggles.reverse()) {
-    code = replaceMatch(code, toggle, `${toggle[1]}${toggle[2]}=${toggle[3]}`);
+
+  for (const toggle of [...inlineToggles].reverse()) {
+    code = replaceMatch(code, toggle, `modelSelectionDisabled:${toggle[1]}`);
   }
   changes.push("keep the effort control able to open the model list while Reserve is available");
-
-  // Older menu builds disable the same control inline when the footer is present.
-  const legacyToggleRe = new RegExp(
-    `modelSelectionDisabled:(${IDENT})\\|\\|(${IDENT})!=null`,
-    "g",
-  );
-  const legacyToggles = [];
-  let legacyToggle;
-  while ((legacyToggle = legacyToggleRe.exec(code))) {
-    const nearby = code.slice(Math.max(0, legacyToggle.index - 700), legacyToggle.index + 200);
-    if (!nearby.includes(`menuFooter:${legacyToggle[2]}`)) continue;
-    legacyToggles.push(legacyToggle);
-  }
-  const sawNullPrefix = effortToggles.some((toggle) => toggle[0].includes("||null!="));
-  if (!sawNullPrefix && effortToggles.length + legacyToggles.length !== 2) {
-    return { detected: true, ok: false, reason: "legacy model-list toggle hook not found" };
-  }
-  if (sawNullPrefix && effortToggles.length === 0) {
-    return { detected: true, ok: false, reason: "model picker effort-toggle disable hook not found" };
-  }
-  if (legacyToggles.length === 1) {
-    code = replaceMatch(
-      code,
-      legacyToggles[0],
-      `modelSelectionDisabled:${legacyToggles[0][1]}`,
-    );
-    changes.push("keep the legacy model-list toggle enabled while the Reserve footer is visible");
-  }
 
   const moonRe = new RegExp(
     `\\(0,${IDENT}\\.jsx\\)\\(${escapeRegExp(BACKTICK)}span${escapeRegExp(
@@ -468,7 +470,7 @@ function patchCurrent(source) {
   const optionLabels = [];
   let optionLabelMatch;
   while ((optionLabelMatch = optionLabelRe.exec(code))) optionLabels.push(optionLabelMatch);
-  if (optionLabels.length !== 1 || (!moon && !code.includes("🌙"))) {
+  if (optionLabels.length !== 1 || (!moon && !hasMoonGlyph(code))) {
     return { detected: true, ok: false, reason: "reserve model option label hook not found" };
   }
   const optionLabel = optionLabels[0];
@@ -483,7 +485,7 @@ function patchCurrent(source) {
   // Refresh the memoized trigger objects when the selected model changes the
   // reserve-mode flag. Te usually changes at the same time, but tracking q is
   // required when a catalog row maps to the same display model.
-  for (const needle of [`selectedLabel:(${modeExpr})?`, `displayName:(${modeExpr})?`]) {
+  for (const needle of [`selectedLabel:(${modeExpr})?`, `displayName:(${modeExpr})?`, `=(${modeExpr})?`]) {
     const needleIndex = code.indexOf(needle);
     if (needleIndex < 0) continue;
     const start = Math.max(gate.index, needleIndex - 1200);
@@ -680,13 +682,18 @@ function hasCoreMarkers(source) {
     source.includes("setModelAndReasoningEffortForNextTurn");
 }
 
+const DESTRUCTURED_CORE_FORCE_RE =
+  `(\\{model:(${IDENT}),reasoningEffort:${IDENT},[^}]+\\}=${IDENT},${IDENT}=)(${IDENT})\\?(${SELECTOR_EXPR}):\\2(?=;)`;
+
 function hasCoreCandidate(source) {
   if (source.includes(CORE_MARKER)) return true;
   if (!hasCoreMarkers(source)) return false;
   // Older bundles spell the wire id inline. 26.1103 reads the exported
-  // constant (`_.qz`) inside the same override.
+  // constant (`_.qz`) inside an if-block; 26.1120 destructures modelSettings
+  // and applies `resolvedModel = isLunaReserveActive ? _.qz : model`.
   return source.includes("gpt-reserve") ||
-    new RegExp(`if\\(${IDENT}\\)\\{let ${IDENT};${IDENT}\\[\\d+\\]!==${IDENT}\\?\\(${IDENT}=\\{\\.\\.\\.${IDENT},model:`).test(source);
+    new RegExp(`if\\(${IDENT}\\)\\{let ${IDENT};${IDENT}\\[\\d+\\]!==${IDENT}\\?\\(${IDENT}=\\{\\.\\.\\.${IDENT},model:`).test(source) ||
+    new RegExp(DESTRUCTURED_CORE_FORCE_RE).test(source);
 }
 
 function patchCompactCore(source) {
@@ -700,10 +707,30 @@ function patchCompactCore(source) {
   const forces = [];
   let force;
   while ((force = forceRe.exec(source))) forces.push(force);
-  if (forces.length !== 1) return null;
-  const activeVar = forces[0][1];
-  const reserveSelector = forces[0][6];
-  let code = source.slice(0, forces[0].index) + source.slice(forces[0].index + forces[0][0].length);
+
+  let activeVar = null;
+  let reserveSelector = null;
+  let code = null;
+
+  if (forces.length === 1) {
+    activeVar = forces[0][1];
+    reserveSelector = forces[0][6];
+    code = source.slice(0, forces[0].index) + source.slice(forces[0].index + forces[0][0].length);
+  } else if (forces.length === 0) {
+    const destructuredRe = new RegExp(DESTRUCTURED_CORE_FORCE_RE, "g");
+    const destructured = [];
+    let dMatch;
+    while ((dMatch = destructuredRe.exec(source))) {
+      if (source.includes(`isLunaReserveActive:${dMatch[3]}`)) destructured.push(dMatch);
+    }
+    if (destructured.length !== 1) return null;
+    const target = destructured[0];
+    activeVar = target[3];
+    reserveSelector = target[4];
+    code = replaceMatch(source, target, `${target[1]}${target[2]}`);
+  } else {
+    return null;
+  }
   const remapRe = new RegExp(
     `${escapeRegExp(activeVar)}&&(${IDENT})===${escapeRegExp(reserveSelector)}\\?(${IDENT}):\\1`,
     "g",
