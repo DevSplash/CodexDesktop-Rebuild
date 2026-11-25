@@ -108,8 +108,10 @@ function legacyCollapseRegex() {
 
 function reserveListInsertion(listVar, reserveRowVar, reserveSelector) {
   // Keep the catalog row that supplied the Reserve display metadata. Insert the
-  // wire-model copy immediately after that row so the two stay adjacent.
-  return `${listVar}=(${listVar}??[]).filter(e=>e.model!==${reserveSelector}),${reserveRowVar}!=null&&${listVar}.splice(${listVar}.includes(${reserveRowVar})?${listVar}.indexOf(${reserveRowVar})+1:${listVar}.length,0,{...${reserveRowVar},model:${reserveSelector}})`;
+  // wire-model copy immediately after that row so the two stay adjacent. Tag the
+  // synthetic row directly so downstream menu modules never need to reference
+  // caller-module bindings such as `G.qz` across Rspack module boundaries.
+  return `${listVar}=(${listVar}??[]).filter(e=>e.model!==${reserveSelector}),${reserveRowVar}!=null&&${listVar}.splice(${listVar}.includes(${reserveRowVar})?${listVar}.indexOf(${reserveRowVar})+1:${listVar}.length,0,{...${reserveRowVar},model:${reserveSelector},__codexLunaReserve:!0})`;
 }
 
 function findLegacyCollapse(source) {
@@ -475,10 +477,14 @@ function patchCurrent(source) {
   }
   const optionLabel = optionLabels[0];
   const [, labelRuntime, labelComponent, labelModel] = optionLabel;
-  const moonChild = moon
-    ? `(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{\"aria-hidden\":${BACKTICK}true${BACKTICK},children:${moon[1]}})`
-    : `(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{\"aria-hidden\":${BACKTICK}true${BACKTICK},children:${BACKTICK}🌙${BACKTICK}})`;
-  const reserveLabel = `label:${labelModel}.model===${reserveSelector}?(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{className:${BACKTICK}flex min-w-0 items-center gap-1${BACKTICK},children:[${moonChild},(0,${labelRuntime}.jsx)(${labelComponent},{model:${labelModel}.model,displayName:${labelModel}.displayName,stripGptPrefix:!0})]}):(0,${labelRuntime}.jsx)(${labelComponent},{model:${labelModel}.model,displayName:${labelModel}.displayName,stripGptPrefix:!0})`;
+  // `optionLabel` lives in a separate Rspack module (`ModelPickerMenu`) from
+  // `gate` (`ModelPicker`), where minified names like `G` can be shadowed by
+  // local props (`{side:G}=e`, undefined at runtime). Never inject `reserveSelector`
+  // or `moon[1]` identifiers from the outer module here.
+  const moonChild = `(0,${labelRuntime}.jsx)(${BACKTICK}span${BACKTICK},{\"aria-hidden\":${BACKTICK}true${BACKTICK},children:${BACKTICK}🌙${BACKTICK}})`;
+  const isReserveOption = `(${labelModel}.__codexLunaReserve===!0||${labelModel}.model===${BACKTICK}gpt-reserve${BACKTICK})`;
+  const jsxMulti = source.includes(`${labelRuntime}.jsxs`) ? "jsxs" : "jsx";
+  const reserveLabel = `label:${isReserveOption}?(0,${labelRuntime}.${jsxMulti})(${BACKTICK}span${BACKTICK},{className:${BACKTICK}flex min-w-0 items-center gap-1${BACKTICK},children:[${moonChild},(0,${labelRuntime}.jsx)(${labelComponent},{model:${labelModel}.model,displayName:${labelModel}.displayName,stripGptPrefix:!0})]}):(0,${labelRuntime}.jsx)(${labelComponent},{model:${labelModel}.model,displayName:${labelModel}.displayName,stripGptPrefix:!0})`;
   code = replaceMatch(code, optionLabel, reserveLabel);
   changes.push("mark the Reserve list row with the Reserve icon");
 
@@ -1210,6 +1216,83 @@ function findUsageTargets(platform, preloadedFiles = null) {
     .map((file) => ({ kind: "usage", platform: file.platform, path: file.path, source: file.source }));
 }
 
+const ALLOWED_SYNTHETIC_PROPS = new Set([
+  "jsx", "jsxs", "filter", "splice", "includes", "indexOf", "length",
+  "set", "add", "delete", "get", "trim", "model", "displayName", "limitName",
+]);
+
+function collectModuleAstFacts(modAst, modSource) {
+  const memberPairs = new Set();
+  const identNames = new Set();
+  function walkAst(node, parent) {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "MemberExpression" && !node.computed &&
+        node.object?.type === "Identifier" && node.property?.type === "Identifier") {
+      memberPairs.add(`${node.object.name}.${node.property.name}`);
+    }
+    if (node.type === "Identifier") {
+      const isPropKey =
+        (parent?.type === "MemberExpression" && !parent.computed && parent.property === node) ||
+        (parent?.type === "Property" && !parent.computed && parent.key === node);
+      if (!isPropKey) identNames.add(node.name);
+    }
+    for (const val of Object.values(node)) {
+      if (Array.isArray(val)) {
+        for (const item of val) if (item && typeof item.type === "string") walkAst(item, node);
+      } else if (val && typeof val.type === "string") {
+        walkAst(val, node);
+      }
+    }
+  }
+  walkAst(modAst, null);
+  return { memberPairs, identNames, source: modSource };
+}
+
+function verifyPatchedSyntaxAndScopes(beforeSource, afterSource) {
+  const afterAst = parse(afterSource, { ecmaVersion: "latest", sourceType: "module" });
+  if (!afterSource.includes("__webpack_modules__")) return;
+  const beforeAst = parse(beforeSource, { ecmaVersion: "latest", sourceType: "module" });
+
+  const getTable = (ast) =>
+    ast.body
+      .flatMap((n) => (n.type === "ExportNamedDeclaration" ? n.declaration?.declarations ?? [] : []))
+      .find((n) => n.id?.name === "__webpack_modules__")?.init;
+
+  const beforeTable = getTable(beforeAst);
+  const afterTable = getTable(afterAst);
+  if (beforeTable?.type !== "ObjectExpression" || afterTable?.type !== "ObjectExpression") return;
+
+  const beforeById = new Map(
+    beforeTable.properties.map((p) => [p.key.name ?? p.key.value, p]),
+  );
+
+  for (const afterProp of afterTable.properties) {
+    const modId = afterProp.key.name ?? afterProp.key.value;
+    const beforeProp = beforeById.get(modId);
+    if (!beforeProp) continue;
+    const beforeModSrc = beforeSource.slice(beforeProp.start, beforeProp.end);
+    const afterModSrc = afterSource.slice(afterProp.start, afterProp.end);
+    if (beforeModSrc === afterModSrc) continue;
+
+    const beforeFacts = collectModuleAstFacts(beforeProp.value, beforeModSrc);
+    const afterFacts = collectModuleAstFacts(afterProp.value, afterModSrc);
+
+    for (const pair of afterFacts.memberPairs) {
+      if (beforeFacts.memberPairs.has(pair)) continue;
+      const [obj, prop] = pair.split(".");
+      if (obj.startsWith("__codex") || prop.startsWith("__codex")) continue;
+      if (beforeFacts.identNames.has(obj) && ALLOWED_SYNTHETIC_PROPS.has(prop)) continue;
+      throw new Error(`Cross-module or unverified member access "${pair}" introduced in Rspack module "${modId}"`);
+    }
+
+    for (const name of afterFacts.identNames) {
+      if (beforeFacts.identNames.has(name)) continue;
+      if (name.startsWith("__codex") || name === "Set" || name === "e" || name === "t" || name === "n") continue;
+      throw new Error(`Cross-module identifier "${name}" introduced in Rspack module "${modId}"`);
+    }
+  }
+}
+
 function applyPatchKind(kind, source) {
   if (kind === "core") return patchCore(source);
   if (kind === "usage") return patchUsage(source);
@@ -1307,9 +1390,9 @@ function main() {
 
     if (!fileChanged) continue;
     try {
-      parse(source, { ecmaVersion: "latest", sourceType: "module" });
+      verifyPatchedSyntaxAndScopes(group[0].source, source);
     } catch (err) {
-      console.error(`    [x] patched output failed JS syntax check: ${err.message}`);
+      console.error(`    [x] patched output failed AST/scope check: ${err.message}`);
       failed++;
       continue;
     }
@@ -1334,6 +1417,7 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
+  verifyPatchedSyntaxAndScopes,
   MARKER,
   CORE_MARKER,
   USAGE_MARKER,
